@@ -21,6 +21,33 @@ def _pt(face):
 
 
 # ==================== planar ====================
+def _sort_by_angle(items, center, normal, key="c"):
+    """按角度排序——用最远点作参考方向，确保不同面坐标系一致"""
+    z = cq.Vector(*normal)
+    oc = cq.Vector(*center)
+    if len(items) < 2:
+        return items
+    # 用面内距离中心最远的点作参考方向（面自身几何特征，跨零件一致）
+    best_d = -1; best_pt = None
+    for it in items:
+        pt = cq.Vector(*it[key]).sub(oc)
+        pt_proj = pt - z * pt.dot(z)
+        d = pt_proj.Length
+        if d > best_d:
+            best_d = d; best_pt = pt_proj
+    x_ref = best_pt.normalized() if best_pt and best_pt.Length > 1e-9 else cq.Vector(1,0,0)
+    x_ref = x_ref - z * (x_ref.dot(z) / z.dot(z))
+    if x_ref.Length < 1e-9:
+        x_ref = cq.Vector(0, 1, 0) - z * (z.y / z.dot(z))
+    x_ref = x_ref.normalized()
+    y_ref = z.cross(x_ref)
+    def _ang(it):
+        pt = cq.Vector(*it[key]).sub(oc)
+        pt_proj = pt - z * pt.dot(z)
+        return math.atan2(pt_proj.dot(y_ref), pt_proj.dot(x_ref))
+    return sorted(items, key=_ang)
+
+
 def extract_planar(shape):
     bb = shape.val().BoundingBox()
     out = []
@@ -38,6 +65,11 @@ def extract_planar(shape):
         if not cs and len(ls) < 2: continue
         if cs or ls:
             c = f.Center(); n = f.normalAt(_pt(f))
+            # 按角度排序，保证跨零件匹配顺序一致（法兰孔对齐关键）
+            if len(cs) > 1:
+                cs = _sort_by_angle(cs, [c.x, c.y, c.z], [n.x, n.y, n.z], "c")
+            if len(ls) > 1:
+                ls = _sort_by_angle(ls, [c.x, c.y, c.z], [n.x, n.y, n.z], "m")
             out.append({
                 "c": [c.x, c.y, c.z], "n": [n.x, n.y, n.z],
                 "circles": cs, "lines": ls,
@@ -84,6 +116,11 @@ def extract_cylinders(shape):
                 "ends": ends
             })
         except Exception: pass
+    # 排序圆柱：确保跨零件匹配顺序一致（螺栓孔对齐关键）
+    out.sort(key=lambda c: (
+        c["ext"], c["r"],
+        round(c["dir"][0], 2), round(c["dir"][1], 2), round(c["dir"][2], 2),
+        round(c["mid"][0], 4), round(c["mid"][1], 4), round(c["mid"][2], 4)))
     return out
 
 

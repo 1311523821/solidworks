@@ -41,18 +41,33 @@ def mk_label(ident, orig, z_dir, extra=None, x_hint=None):
             "userData": ud}
 
 
-def planar_labels(m, na, nb, idx):
+def planar_labels(m, na, nb, idx, slot_x_a=None, slot_x_b=None):
     fa, fb = m["fa"], m["fb"]
     oa, ob_ = fa["c"], fb["c"]
     meta = {"matchType": "PLANAR", "total": m["t"]}
     xa = xb = None
-    # 优先用线（空间匹配保证方向一致），线为空时才用圆
-    if m["ml"]:
-        xa = _vec_sub(m["ml"][0][0]["m"], oa)
-        xb = _vec_sub(m["ml"][0][1]["m"], ob_)
-    elif m["mc"]:
-        xa = _vec_sub(m["mc"][0][0]["c"], oa)
-        xb = _vec_sub(m["mc"][0][1]["c"], ob_)
+    # 优先用槽方向（来自slot检测），否则用圆方向（螺栓孔）
+    if slot_x_a:
+        xa = slot_x_a
+    if slot_x_b:
+        xb = slot_x_b
+    if not xa and not xb:
+        if m["mc"] and (len(m["mc"]) >= len(m.get("ml", [])) or not m.get("ml")):
+            xa = _vec_sub(m["mc"][0][0]["c"], oa)
+            xb = _vec_sub(m["mc"][0][1]["c"], ob_)
+        elif m["ml"]:
+            xa = _vec_sub(m["ml"][0][0]["m"], oa)
+            xb = _vec_sub(m["ml"][0][1]["m"], ob_)
+    elif not xa:
+        if m["mc"] and (len(m["mc"]) >= len(m.get("ml", [])) or not m.get("ml")):
+            xa = _vec_sub(m["mc"][0][0]["c"], oa)
+        elif m["ml"]:
+            xa = _vec_sub(m["ml"][0][0]["m"], oa)
+    elif not xb:
+        if m["mc"] and (len(m["mc"]) >= len(m.get("ml", [])) or not m.get("ml")):
+            xb = _vec_sub(m["mc"][0][1]["c"], ob_)
+        elif m["ml"]:
+            xb = _vec_sub(m["ml"][0][1]["m"], ob_)
     return (mk_label(f"{na}_Mating_{idx}", oa, fa["n"], meta, xa),
             mk_label(f"{nb}_Mating_{idx}", ob_, _neg(fb["n"]), meta, xb))
 
@@ -71,7 +86,10 @@ def _bore_face_intersection(bore, face):
 
 def cylinder_labels(m, na, nb, idx, bore_origin=None, shaft_x=None, bore_x=None, shaft_origin=None):
     s, b = m["shaft"], m["bore"]
+    bore_to_bore = m.get("bore_to_bore", False)
     meta = {"matchType": "CYLINDER", "radius": s["r"]}
+    if bore_to_bore:
+        meta["boreToBore"] = True
     o_shaft = shaft_origin if shaft_origin else s["mid"]
     o_bore = bore_origin if bore_origin else b["mid"]
     shaft_nm = na if m["shaft_in_a"] else nb

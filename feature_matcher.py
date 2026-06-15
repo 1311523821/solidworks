@@ -7,7 +7,7 @@ feature_matcher.py
 """
 import os, sys, json, math
 import cadquery as cq
-from label_generator import planar_labels, cylinder_labels, _bore_face_intersection, _neg, _vec_sub, mk_label, fmt_json
+from label_generator import planar_labels, cylinder_labels, _bore_face_intersection, _neg, _vec_sub, mk_label, fmt_json, _ortho
 
 TOL = 0.1; MIN_OK = 3; MIN_OK_LOOSE = 2; CYL_TOL = 0.5; SLOT_MIN = 2
 MULTI_CYL_THRESHOLD = 50  # 超过此数量触发框架嵌入逻辑
@@ -49,9 +49,11 @@ def match_slot(fa, fb):
 def match_cylinders(ca, cb, strict_axis=False, ref_a=None, ref_b=None):
     """圆柱匹配：半径相等 + 可选轴过滤 + 可选空间偏移验证"""
     ms = []
+    used_b = set()  # 防止孔-孔匹配中同一目标被多次匹配
     for a in ca:
-        for b in cb:
-            if a["ext"] == b["ext"]: continue
+        for b_idx, b in enumerate(cb):
+            same_type = a["ext"] == b["ext"]
+            if same_type and a["ext"]: continue  # 跳过轴-轴，只保留孔-孔（螺栓对齐）和轴-孔
             if abs(a["r"] - b["r"]) > CYL_TOL: continue
             if strict_axis:
                 dot = abs(a["dir"][0]*b["dir"][0] + a["dir"][1]*b["dir"][1] + a["dir"][2]*b["dir"][2])
@@ -61,8 +63,26 @@ def match_cylinders(ca, cb, strict_axis=False, ref_a=None, ref_b=None):
                 da = sum((a["mid"][k] - ref_a[k])**2 for k in range(3))**0.5
                 db = sum((b["mid"][k] - ref_b[k])**2 for k in range(3))**0.5
                 if abs(da - db) > 5: continue
-            ms.append({"shaft": a if a["ext"] else b,
-                       "bore": b if a["ext"] else a, "shaft_in_a": a["ext"]})
+            if same_type:  # 孔-孔：螺栓对齐 — 空间验证防配对错乱
+                if b_idx in used_b: continue  # 每个目标只用一次
+                # 用最大内孔做参考，验证径向距离一致
+                big_a = max((c for c in ca if not c["ext"]), key=lambda c: c["r"], default=None)
+                big_b = max((c for c in cb if not c["ext"]), key=lambda c: c["r"], default=None)
+                if big_a and big_b and big_a["r"] > a["r"] and big_b["r"] > b["r"]:
+                    import cadquery as cq
+                    def _radial(cyl, ref):
+                        m = cq.Vector(*cyl["mid"]); rm = cq.Vector(*ref["mid"])
+                        rd = cq.Vector(*ref["dir"])
+                        return (m - rm - rd * (m - rm).dot(rd)).Length
+                    ra = _radial(a, big_a); rb = _radial(b, big_b)
+                    if abs(ra - rb) > 1.0:
+                        continue
+                used_b.add(b_idx)
+                ms.append({"shaft": a, "bore": b, "shaft_in_a": True, "bore_to_bore": True})
+                break  # 每个源只匹配第一个合格目标
+            else:
+                ms.append({"shaft": a if a["ext"] else b,
+                           "bore": b if a["ext"] else a, "shaft_in_a": a["ext"]})
     return ms
 
 
@@ -97,6 +117,48 @@ def _shaft_keyway_filter(cylinders, planar_faces):
         if abs(radial.Length - r) < 8 and len(f["lines"]) >= 4:
             out.append(f)
     return out if out else planar_faces
+
+
+# ========== 阵列检测 ==========
+def _is_circular_array(face):
+    """检测面上的圆是否构成圆周阵列（螺栓孔模式）"""
+    circles = face.get("circles", [])
+    if len(circles) < 3: return False
+    # 检查是否大多数圆半径相同
+    radii = [c["len"] / (2*math.pi) for c in circles]
+    median_r = sorted(radii)[len(radii)//2]
+    same_r = sum(1 for r in radii if abs(r - median_r) < 0.5)
+    if same_r < 3: return False
+    # 计算圆心的中心点
+    cx = sum(c["c"][0] for c in circles) / len(circles)
+    cy = sum(c["c"][1] for c in circles) / len(circles)
+    # 检查同半径圆到中心的距离是否相近
+    dists = []
+    for c in circles:
+        r = c["len"] / (2*math.pi)
+        if abs(r - median_r) < 0.5:
+            d = ((c["c"][0]-cx)**2 + (c["c"][1]-cy)**2)**0.5
+            dists.append(d)
+    if len(dists) < 3: return False
+    median_d = sorted(dists)[len(dists)//2]
+    consistent = sum(1 for d in dists if abs(d - median_d) < max(5, median_d*0.1))
+    return consistent >= 3  # at least 3 holes on the same bolt circle
+
+
+def _is_linear_array(faces, axis=0):
+    """检测面集合是否构成线性阵列（沿 axis 轴等间距排列）"""
+    if len(faces) < 2: return False
+    # 提取中心坐标 + 面积
+    pts = [(f["c"][axis], f.get("area", 0)) for f in faces]
+    pts.sort()
+    # 计算间距
+    gaps = [pts[i+1][0] - pts[i][0] for i in range(len(pts)-1)]
+    if not gaps: return False
+    median_gap = sorted(gaps)[len(gaps)//2]
+    if median_gap < 5: return False
+    # 检查间距一致性（间距偏差 < 20%）
+    consistent = sum(1 for g in gaps if abs(g - median_gap) < max(median_gap*0.25, 10))
+    return consistent >= len(gaps) - 1  # allow at most 1 outlier
 
 
 # ========== 框架嵌入匹配（Step 0）==========
@@ -240,20 +302,23 @@ def _frame_in_frame(na, nb, parts, labels, idx_counter, face_info, used_p):
     cage_z_max = max(f["c"][2] for f in all_cage_faces)
 
     def _check_collision(fan_face, cage_face):
-        """检查配对后FAN是否在CAGE内（不碰撞）"""
+        """检查配对后FAN是否在CAGE内（沿面法向不碰撞）"""
         fn = cq.Vector(fan_face["n"][0], fan_face["n"][1], fan_face["n"][2])
         cn = cq.Vector(cage_face["n"][0], cage_face["n"][1], cage_face["n"][2])
         # 法向必须相反
-        if fn.dot(cn) > -0.5:
+        # FIF faces are Z-aligned (abs(n[2])>0.9), compare Z signs only
+        if fn.z * cn.z > -0.25:  # opposite Z signs = facing each other
             return False
-        # 计算Z方向偏移
+        # Z-axis depth check (both CS use Z for face normal by FIF filter)
+        fan_z_min = min(f["c"][2] for f in all_fan_faces)
+        fan_z_max = max(f["c"][2] for f in all_fan_faces)
+        cage_z_min = min(f["c"][2] for f in all_cage_faces)
+        cage_z_max = max(f["c"][2] for f in all_cage_faces)
         dz = cage_face["c"][2] - fan_face["c"][2]
-        fan_top_world = fan_z_max + dz
-        fan_bot_world = fan_z_min + dz
-        # FAN必须在CAGE z范围内
-        if fan_top_world < cage_z_max and fan_bot_world > cage_z_min:
-            return True  # 无碰撞
-        return False  # 有碰撞
+        fan_top = fan_z_max + dz; fan_bot = fan_z_min + dz
+        if fan_top < cage_z_max + 5 and fan_bot > cage_z_min - 5:
+            return True
+        return False
 
     # 按z从高到低排序FAN框架面（优先选顶部面→FAN嵌入更深）
     fan_frames = sorted(fan_frames_init, key=lambda f: f["c"][2], reverse=True)
@@ -269,7 +334,7 @@ def _frame_in_frame(na, nb, parts, labels, idx_counter, face_info, used_p):
         for f in cage_slots:
             cn = cq.Vector(f["n"][0], f["n"][1], f["n"][2])
             fn = cq.Vector(fan_frame["n"][0], fan_frame["n"][1], fan_frame["n"][2])
-            if fn.dot(cn) < -0.5:
+            if fn.z * cn.z < -0.25:  # FIF faces Z-aligned, compare Z sign
                 cage_candidates.append(f)
         if not cage_candidates:
             cage_candidates = cage_slots
@@ -302,6 +367,29 @@ def _frame_in_frame(na, nb, parts, labels, idx_counter, face_info, used_p):
                 slot_matches.append((xy_key, score, fan_frame, cage_cand, ml, mc))
 
         # 为每个去重后的槽位生成面标签
+        # 线性阵列过滤：找核心阵列（最多等间距面），剔除离群假阳性
+        if len(slot_matches) > 3:
+            cage_list = [cage_cand for _, _, _, cage_cand, _, _ in slot_matches]
+            # 提取X坐标和面积，找间距最一致的子集
+            pts = sorted([(f["c"][0], f["c"][1], f) for f in cage_list])
+            best_subset = pts  # 默认全保留
+            best_count = 0
+            # 滑动窗口：找到连续性最好的子集
+            for i in range(len(pts)):
+                for j in range(i+3, len(pts)+1):
+                    subset = pts[i:j]
+                    xs = [p[0] for p in subset]
+                    gaps = [xs[k+1]-xs[k] for k in range(len(xs)-1)]
+                    if not gaps: continue
+                    median_gap = sorted(gaps)[len(gaps)//2]
+                    if median_gap < 5: continue
+                    consistent = sum(1 for g in gaps if abs(g-median_gap) < max(median_gap*0.25, 10))
+                    if consistent == len(gaps) and len(subset) > best_count:
+                        best_count = len(subset); best_subset = subset
+            if best_count >= 3:
+                kept_x = {p[2]["c"][0] for p in best_subset}
+                slot_matches = [sm for sm in slot_matches if sm[3]["c"][0] in kept_x]
+
         for xy_key, score, ff, cage_cand, ml, mc in slot_matches:
             t = len(mc) + len(ml)
             m = {"fa": ff, "fb": cage_cand, "mc": mc, "ml": ml, "t": t}
@@ -403,9 +491,20 @@ def match_all(parts):
             # multi-hole filter
             ca = len(parts[na]["features"]["cylinders"])
             cb = len(parts[nb]["features"]["cylinders"])
-            if ca > 50 and cb > 50 and abs(n_a.dot(n_b)) < 0.7: continue
-            print(f"  [{idx[0]}] {na} <-> {nb}: {len(m['mc'])}c+{len(m['ml'])}l")
+            # only filter if both faces are Z-dominant (same coordinate direction)
+            if ca > 50 and cb > 50 and abs(n_a[2]) > 0.7 and abs(n_b[2]) > 0.7 and n_a[2]*n_b[2] < 0: continue
+            # 阵列加分：如果两面都有圆周阵列（螺栓法兰），提高标签优先级
+            is_array_a = _is_circular_array(m["fa"])
+            is_array_b = _is_circular_array(m["fb"])
+            array_bonus = " [ARRAY]" if (is_array_a and is_array_b) else ""
+            print(f"  [{idx[0]}] {na} <-> {nb}: {len(m['mc'])}c+{len(m['ml'])}l{array_bonus}")
             la, lb = planar_labels(m, na, nb, idx[0])
+            # 记录面标签，供 Step 2 后用槽方向修正 xDir
+            if "flange" in na.lower() and "flange" in nb.lower():
+                _flange_face_labels = getattr(match_all, '_flange_face_labels', None)
+                if _flange_face_labels is None:
+                    match_all._flange_face_labels = []
+                match_all._flange_face_labels.append((na, nb, la, lb, m))
             labels[na].append(la); labels[nb].append(lb)
             if na not in face_info:
                 face_info[na] = {"c": m["fa"]["c"], "n": m["fa"]["n"]}
@@ -417,7 +516,7 @@ def match_all(parts):
                                  "x": lb["geometry"]["x"], "y": lb["geometry"]["y"]}
             break
 
-    # === Step 2: slot ===
+    # === Step 2: slot detection (store slot face positions for CYLINDER label xDir) ===
     if sh_name:
         sh_feat = parts[sh_name]["features"]
         sh_filtered = _shaft_keyway_filter(sh_feat["cylinders"], sh_feat["planar"])
@@ -432,15 +531,48 @@ def match_all(parts):
                     fk = _fk(m["fb"])
                     if fk in used_p.get(fl_name, set()): continue
                     used_p.setdefault(fl_name, set()).add(fk)
-                    idx[0] += 1
-                    print(f"  [{idx[0]}] {sh_name} <-> {fl_name}: {len(m['mc'])}c+{len(m['ml'])}l [SLOT]")
-                    la, lb = planar_labels(m, sh_name, fl_name, idx[0])
-                    labels[sh_name].append(la); labels[fl_name].append(lb)
                     if fl_name not in face_info:
                         face_info[fl_name] = {"c": m["fb"]["c"], "n": m["fb"]["n"]}
+                    if sh_name not in face_info:
+                        face_info[sh_name] = {"c": m["fa"]["c"], "n": m["fa"]["n"]}
                     slot_faces[fl_name] = m["fb"]["c"]
                     slot_faces[sh_name] = m["fa"]["c"]
                     break
+
+    # === Post-process: 修正 flange-flange 面标签的 xDir（用槽方向替代圆方向）===
+    if hasattr(match_all, '_flange_face_labels'):
+        for na, nb, la, lb, m in match_all._flange_face_labels:
+            fa_has_slot = na in slot_faces
+            fb_has_slot = nb in slot_faces
+            if not fa_has_slot and not fb_has_slot:
+                continue
+
+            def _slot_x(part_name, face_center, face_normal, slot_center):
+                """面心到槽面心的方向，投影到面平面"""
+                fc = cq.Vector(*face_center)
+                fn = cq.Vector(*face_normal)
+                sc = cq.Vector(*slot_center)
+                dir_to_slot = sc - fc
+                # 投影到面平面
+                proj = dir_to_slot - fn * (dir_to_slot.dot(fn) / fn.dot(fn))
+                if proj.Length < 0.1:
+                    return None
+                return [proj.x, proj.y, proj.z]
+
+            oa = m["fa"]["c"]; ob = m["fb"]["c"]
+            fn_a = m["fa"]["n"]; fn_b = m["fb"]["n"]
+
+            if fa_has_slot:
+                sx_a = _slot_x(na, oa, fn_a, slot_faces[na])
+                if sx_a:
+                    la["geometry"].update(_ortho(
+                    [la["geometry"]["z"]["x"], la["geometry"]["z"]["y"], la["geometry"]["z"]["z"]], sx_a))
+            if fb_has_slot:
+                sx_b = _slot_x(nb, ob, fn_b, slot_faces[nb])
+                if sx_b:
+                    lb["geometry"].update(_ortho(
+                        [lb["geometry"]["z"]["x"], lb["geometry"]["z"]["y"], lb["geometry"]["z"]["z"]], sx_b))
+        del match_all._flange_face_labels
 
     # === Step 3: cylinder matching ===
     cyl_pairs = []
@@ -479,27 +611,48 @@ def match_all(parts):
         pair[2].sort(key=lambda m: m["shaft"]["r"], reverse=True)
 
     used_c = {}
+    used_sf = set()  # 去重 shaft-flange: 只保留一对
     for na, nb, ms in cyl_pairs:
         for m in ms:
             s_has = na if m["shaft_in_a"] else nb
             b_has = nb if m["shaft_in_a"] else na
+            # 去重：shaft-flange 只保留第一个 CYLINDER 对（另一个 flange 通过 face 标签连接）
+            is_sf = (sh_name and (s_has == sh_name or b_has == sh_name)
+                     and any("flange" in x for x in (na, nb)))
+            if is_sf:
+                sf_key = "shaft-flange"
+                if sf_key in used_sf: continue
+                used_sf.add(sf_key)
             kb = _ck(m["bore"])
             if kb in used_c.get(b_has, set()): continue
             used_c.setdefault(b_has, set()).add(kb)
-            # 孔/轴都投影到配合面上（避免轴中点差造成z偏移）
+            s_cyl = m["shaft"]; b_cyl = m["bore"]
+            # 各自 CS 内计算投影点（绝不跨 CS 混合）
             bore_pt = None; shaft_pt = None
             if b_has in face_info:
                 bore_pt = _bore_face_intersection(m["bore"], face_info[b_has])
             if s_has in face_info:
                 shaft_pt = _bore_face_intersection(m["shaft"], face_info[s_has])
-            s_cyl = m["shaft"]; b_cyl = m["bore"]
+            # shaft-flange: 将轴的 keyway 面心投影到轴线上（均在轴的CS内），
+            # 使 flange keyway 与 shaft keyway 沿轴向对齐
+            if is_sf and s_has in face_info:
+                fc_s = face_info[s_has]["c"]  # shaft keyway 面心（轴的 CS）
+                sd = cq.Vector(s_cyl["dir"][0], s_cyl["dir"][1], s_cyl["dir"][2])
+                sm = cq.Vector(s_cyl["mid"][0], s_cyl["mid"][1], s_cyl["mid"][2])
+                fc_v = cq.Vector(fc_s[0], fc_s[1], fc_s[2])
+                # keyway 面心沿轴方向投影到轴线上（轴的 CS 内）
+                proj = fc_v.sub(sm).dot(sd)
+                shaft_pt = [sm.x + sd.x*proj, sm.y + sd.y*proj, sm.z + sd.z*proj]
             s_x = None; b_x = None
-            if s_has in slot_faces:
-                s_x = _vec_sub(slot_faces[s_has], s_cyl["mid"])
-            if b_has in slot_faces:
-                b_x = _vec_sub(slot_faces[b_has], b_cyl["mid"])
+            # 仅 shaft-flange 对使用 slot xDir（bore-bore 不需要）
+            if is_sf:
+                if s_has in slot_faces:
+                    s_x = _vec_sub(slot_faces[s_has], s_cyl["mid"])
+                if b_has in slot_faces:
+                    b_x = _vec_sub(slot_faces[b_has], b_cyl["mid"])
             idx[0] += 1
-            print(f"  [{idx[0]}] {na}<->{nb}: R={m['shaft']['r']:.2f}")
+            slot_note = " [SLOT-x]" if (s_x or b_x) else ""
+            print(f"  [{idx[0]}] {na}<->{nb}: R={m['shaft']['r']:.2f}{slot_note}")
             la, lb = cylinder_labels(m, na, nb, idx[0], bore_pt, s_x, b_x, shaft_pt)
             labels[na].append(la); labels[nb].append(lb)
 
