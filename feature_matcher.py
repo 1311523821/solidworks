@@ -304,18 +304,11 @@ def _frame_in_frame(na, nb, parts, labels, idx_counter, face_info, used_p, fif_s
         (fan_bb.ymin + fan_bb.ymax) / 2,
         (fan_bb.zmin + fan_bb.zmax) / 2,
     )
-    # 过滤FAN框架面：只保留身体伸入槽内的面
-    # 面法向朝外(背离实体)，实体在法向反方向。正确的装配面应使实体伸入槽内。
-    # 对于CAGE槽底面(法向朝槽开口)，FAN实体应在法向反方向(伸入槽内)。
-    # 等价于：在FAN CS内，(centroid_z - face_z)与face_n_z异号
-    # 因为法向朝外，实体在法向反方向 → centroid_z在face_z的n_z反方向
+    # 过滤FAN框架面：只保留实体在法向反方向的面（法向朝外，实体在法向反方向=正确配合面）
     valid_fan_frames = []
     for ff in fan_frames_init:
-        fn_z = ff["n"][2]
-        fc_z = ff["c"][2]
-        body_dir = fan_centroid.z - fc_z  # face->centroid, into solid body
-        # body on opposite side of outward normal -> bodyDir*fnZ<0 -> correct mating face
-        if body_dir * fn_z < 0:
+        body_dir = fan_centroid.z - ff["c"][2]  # face->centroid, into solid body
+        if body_dir * ff["n"][2] < 0:  # body on opposite side of outward normal
             valid_fan_frames.append(ff)
     if valid_fan_frames:
         fan_frames_init = valid_fan_frames
@@ -345,6 +338,10 @@ def _frame_in_frame(na, nb, parts, labels, idx_counter, face_info, used_p, fif_s
                 continue
             ml = _match_lines_spatial(fan_frame.get("lines", []), f.get("lines", []),
                                       fan_frame["c"], f["c"], len_tol=5.0)
+            # 回退：线碎段化导致长度不匹配，放宽长度公差重试
+            if len(ml) < 2:
+                ml = _match_lines_spatial(fan_frame.get("lines", []), f.get("lines", []),
+                                          fan_frame["c"], f["c"], len_tol=999.0)
             if len(ml) < 1:
                 continue
             mc = _match_list(fan_frame.get("circles", []), f.get("circles", []), "len", 1.0)
@@ -357,34 +354,39 @@ def _frame_in_frame(na, nb, parts, labels, idx_counter, face_info, used_p, fif_s
     if not all_pairs:
         return False
 
-    # XY去重+Z深度优先：同一XY位置可能有多层平行面（外端面/内台阶面）
-    # 内台阶面是真正的装配基准面，depth_z更小 = 在法向反方向上更深
-    xy_best = {}  # (x10, y10) -> (score, ff, cage_cand, ml, mc, depth_z)
+    # XY去重+体不对称度优先：
+    # 1) 不同FAN面：选body_offset更大的（主体偏向一侧=正确配合面）
+    # 2) 同FAN面：选Z更深的内台阶面
+    # 3) 同层：按得分
+    xy_best = {}  # (x10, y10) -> (score, ff, cage_cand, ml, mc, body_offset, depth_z)
     for score, ff, cage_cand, ml, mc in all_pairs:
         x_key = round(cage_cand["c"][0] / 10) * 10
         y_key = round(cage_cand["c"][1] / 10) * 10
         xy = (x_key, y_key)
-        # depth_z = Z坐标沿法向的符号化深度（越小越靠内/越深）
         n_sign = 1 if cage_cand["n"][2] > 0 else -1
         depth_z = cage_cand["c"][2] * n_sign
+        body_off = abs(fan_centroid.z - ff["c"][2])  # 面心到质心距离=体不对称度
         if xy not in xy_best:
-            xy_best[xy] = (score, ff, cage_cand, ml, mc, depth_z)
+            xy_best[xy] = (score, ff, cage_cand, ml, mc, body_off, depth_z)
         else:
-            old_depth = xy_best[xy][5]
-            old_score = xy_best[xy][0]
-            # 深度差>2mm：明确是不同层 → 优先选内层（depth_z更小=更深）
-            if abs(depth_z - old_depth) > 2.0:
+            old_score, _, _, _, _, old_body, old_depth = xy_best[xy]
+            # 不同FAN面(body_off差>5mm) → body_off大的优先
+            if abs(body_off - old_body) > 5:
+                if body_off > old_body:
+                    xy_best[xy] = (score, ff, cage_cand, ml, mc, body_off, depth_z)
+            # 同FAN面 → Z深度优先(同法向符号可比)
+            elif abs(depth_z - old_depth) > 2.0:
                 if depth_z < old_depth:
-                    xy_best[xy] = (score, ff, cage_cand, ml, mc, depth_z)
-            # 同层：按得分选
+                    xy_best[xy] = (score, ff, cage_cand, ml, mc, body_off, depth_z)
+            # 同层 → 得分优先
             elif score > old_score:
-                xy_best[xy] = (score, ff, cage_cand, ml, mc, depth_z)
+                xy_best[xy] = (score, ff, cage_cand, ml, mc, body_off, depth_z)
 
     # 按得分降序，贪婪选择（每个物理位置只选一次）
     dedup_pairs = sorted(xy_best.values(), key=lambda x: x[0], reverse=True)
     kept_pairs = []
     used_slots = set()
-    for score, ff, cage_cand, ml, mc, _depth_z in dedup_pairs:
+    for score, ff, cage_cand, ml, mc, _bo, _dz in dedup_pairs:
         x_key = round(cage_cand["c"][0] / 10) * 10
         y_key = round(cage_cand["c"][1] / 10) * 10
         if (x_key, y_key) in used_slots:
