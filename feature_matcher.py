@@ -265,11 +265,12 @@ def _find_cage_frame_candidates(planar_faces):
     return candidates
 
 
-def _frame_in_frame(na, nb, parts, labels, idx_counter, face_info, used_p):
+def _frame_in_frame(na, nb, parts, labels, idx_counter, face_info, used_p, fif_slot_centers):
     """
     框架嵌入匹配：一个零件的框架嵌入另一个零件的槽位。
     策略：遍历所有FAN框架面 → 与CAGE槽面匹配 → 选无碰撞的最佳组合。
     返回: True/False
+    fif_slot_centers: 记录 cage_name -> [(cx, cy, frame_size), ...] 供Step3同CS过滤用
     """
     fa_list = parts[na]["features"]["planar"]
     fb_list = parts[nb]["features"]["planar"]
@@ -293,127 +294,164 @@ def _frame_in_frame(na, nb, parts, labels, idx_counter, face_info, used_p):
         cage_slots, fan_frames_init = slot_b, slot_a
         cage_name, fan_name = nb, na
 
-    # 计算FAN和CAGE的z范围（用于碰撞检测）
-    all_fan_faces = parts[fan_name]["features"]["planar"]
-    fan_z_min = min(f["c"][2] for f in all_fan_faces)
-    fan_z_max = max(f["c"][2] for f in all_fan_faces)
-    all_cage_faces = parts[cage_name]["features"]["planar"]
-    cage_z_min = min(f["c"][2] for f in all_cage_faces)
-    cage_z_max = max(f["c"][2] for f in all_cage_faces)
+    # 加载FAN几何体计算质心（用于过滤前/后面歧义）
+    from cadquery import importers as cq_importers
+    fan_shape_path = parts[fan_name]["shape_path"]
+    fan_shape = cq_importers.importStep(fan_shape_path).val()
+    fan_bb = fan_shape.BoundingBox()
+    fan_centroid = cq.Vector(
+        (fan_bb.xmin + fan_bb.xmax) / 2,
+        (fan_bb.ymin + fan_bb.ymax) / 2,
+        (fan_bb.zmin + fan_bb.zmax) / 2,
+    )
+    # 过滤FAN框架面：只保留身体伸入槽内的面
+    # 面法向朝外(背离实体)，实体在法向反方向。正确的装配面应使实体伸入槽内。
+    # 对于CAGE槽底面(法向朝槽开口)，FAN实体应在法向反方向(伸入槽内)。
+    # 等价于：在FAN CS内，(centroid_z - face_z)与face_n_z异号
+    # 因为法向朝外，实体在法向反方向 → centroid_z在face_z的n_z反方向
+    valid_fan_frames = []
+    for ff in fan_frames_init:
+        fn_z = ff["n"][2]
+        fc_z = ff["c"][2]
+        body_dir = fan_centroid.z - fc_z  # face->centroid, into solid body
+        # body on opposite side of outward normal -> bodyDir*fnZ<0 -> correct mating face
+        if body_dir * fn_z < 0:
+            valid_fan_frames.append(ff)
+    if valid_fan_frames:
+        fan_frames_init = valid_fan_frames
 
-    def _check_collision(fan_face, cage_face):
-        """检查配对后FAN是否在CAGE内（沿面法向不碰撞）"""
-        fn = cq.Vector(fan_face["n"][0], fan_face["n"][1], fan_face["n"][2])
-        cn = cq.Vector(cage_face["n"][0], cage_face["n"][1], cage_face["n"][2])
-        # 法向必须相反
-        # FIF faces are Z-aligned (abs(n[2])>0.9), compare Z signs only
-        if fn.z * cn.z > -0.25:  # opposite Z signs = facing each other
-            return False
-        # Z-axis depth check (both CS use Z for face normal by FIF filter)
-        fan_z_min = min(f["c"][2] for f in all_fan_faces)
-        fan_z_max = max(f["c"][2] for f in all_fan_faces)
-        cage_z_min = min(f["c"][2] for f in all_cage_faces)
-        cage_z_max = max(f["c"][2] for f in all_cage_faces)
-        dz = cage_face["c"][2] - fan_face["c"][2]
-        fan_top = fan_z_max + dz; fan_bot = fan_z_min + dz
-        if fan_top < cage_z_max + 5 and fan_bot > cage_z_min - 5:
-            return True
+    # 面特征Key（用于去重）
+    def _fk_face(f):
+        return f"p|{f['c'][0]:.4f}|{f['c'][1]:.4f}|{f['c'][2]:.4f}|{f['n'][0]:.4f}|{f['n'][1]:.4f}|{f['n'][2]:.4f}"
+
+    # 过滤已占用的CAGE槽位（1-to-1：每个槽位只放一个FAN）
+    # FAN面不过滤——只有一个FAN零件，每个槽位复用它
+    cage_slots = [f for f in cage_slots if _fk_face(f) not in used_p.get(cage_name, set())]
+    if not cage_slots or not fan_frames_init:
         return False
 
-    # 按z从高到低排序FAN框架面（优先选顶部面→FAN嵌入更深）
-    fan_frames = sorted(fan_frames_init, key=lambda f: f["c"][2], reverse=True)
+    # 碰撞检测：法向相反即通过
+    def _check_fit(fan_face, cage_face):
+        return fan_face["n"][2] * cage_face["n"][2] < -0.25
 
-    # 对每个FAN框架面，尝试匹配所有CAGE槽面（一对多：每个槽一个FAN）
     found_any = False
-    face_info_note = {}
-    used_xy = set()  # 去重：同一XY位置只保留最佳匹配
-    for fan_frame in fan_frames:
-        fan_center = cq.Vector(fan_frame["c"][0], fan_frame["c"][1], fan_frame["c"][2])
-
-        cage_candidates = []
+    # 收集所有 (fan_frame, cage_slot) 匹配对，然后贪婪选择+阵列过滤
+    all_pairs = []  # (score, fan_frame, cage_cand, ml, mc)
+    for fan_frame in fan_frames_init:
         for f in cage_slots:
             cn = cq.Vector(f["n"][0], f["n"][1], f["n"][2])
             fn = cq.Vector(fan_frame["n"][0], fan_frame["n"][1], fan_frame["n"][2])
-            if fn.z * cn.z < -0.25:  # FIF faces Z-aligned, compare Z sign
-                cage_candidates.append(f)
-        if not cage_candidates:
-            cage_candidates = cage_slots
-
-        cage_candidates.sort(key=lambda f: (f["c"][0] - fan_center.x)**2 + (f["c"][1] - fan_center.y)**2)
-
-        # 收集每个槽位的最佳匹配，按XY去重
-        slot_matches = []  # (xy_key, score, fan_frame, cage_cand, ml, mc)
-        for cage_cand in cage_candidates:
-            ml = _match_lines_spatial(fan_frame.get("lines", []), cage_cand.get("lines", []),
-                                      fan_frame["c"], cage_cand["c"], len_tol=20.0)
+            if fn.z * cn.z > -0.25:
+                continue
+            ml = _match_lines_spatial(fan_frame.get("lines", []), f.get("lines", []),
+                                      fan_frame["c"], f["c"], len_tol=5.0)
             if len(ml) < 1:
                 continue
-            mc = _match_list(fan_frame.get("circles", []), cage_cand.get("circles", []), "len", 1.0)
-            if not _check_collision(fan_frame, cage_cand):
+            mc = _match_list(fan_frame.get("circles", []), f.get("circles", []), "len", 1.0)
+            if not _check_fit(fan_frame, f):
                 continue
-            x_key = round(cage_cand["c"][0] / 10) * 10  # 10mm精度分组
-            y_key = round(cage_cand["c"][1] / 10) * 10
-            xy_key = (x_key, y_key)
-            score = len(ml) * 10 + len(mc)
-            # 同一位置只保留最高分
-            replaced = False
-            for i, (ek, es, _, _, _, _) in enumerate(slot_matches):
-                if ek == xy_key:
-                    if score > es:
-                        slot_matches[i] = (xy_key, score, fan_frame, cage_cand, ml, mc)
-                    replaced = True
-                    break
-            if not replaced:
-                slot_matches.append((xy_key, score, fan_frame, cage_cand, ml, mc))
+            len_penalty = sum(abs(al["len"] - bl["len"]) for al, bl in ml)
+            score = len(ml) * 10 + len(mc) - len_penalty * 0.5
+            all_pairs.append((score, fan_frame, f, ml, mc))
 
-        # 为每个去重后的槽位生成面标签
-        # 线性阵列过滤：找核心阵列（最多等间距面），剔除离群假阳性
-        if len(slot_matches) > 3:
-            cage_list = [cage_cand for _, _, _, cage_cand, _, _ in slot_matches]
-            # 提取X坐标和面积，找间距最一致的子集
-            pts = sorted([(f["c"][0], f["c"][1], f) for f in cage_list])
-            best_subset = pts  # 默认全保留
-            best_count = 0
-            # 滑动窗口：找到连续性最好的子集
-            for i in range(len(pts)):
-                for j in range(i+3, len(pts)+1):
-                    subset = pts[i:j]
-                    xs = [p[0] for p in subset]
-                    gaps = [xs[k+1]-xs[k] for k in range(len(xs)-1)]
-                    if not gaps: continue
-                    median_gap = sorted(gaps)[len(gaps)//2]
-                    if median_gap < 5: continue
-                    consistent = sum(1 for g in gaps if abs(g-median_gap) < max(median_gap*0.25, 10))
-                    if consistent == len(gaps) and len(subset) > best_count:
-                        best_count = len(subset); best_subset = subset
-            if best_count >= 3:
-                kept_x = {p[2]["c"][0] for p in best_subset}
-                slot_matches = [sm for sm in slot_matches if sm[3]["c"][0] in kept_x]
+    if not all_pairs:
+        return False
 
-        for xy_key, score, ff, cage_cand, ml, mc in slot_matches:
-            t = len(mc) + len(ml)
-            m = {"fa": ff, "fb": cage_cand, "mc": mc, "ml": ml, "t": t}
-            if fan_name != na:
-                na_real, nb_real = fan_name, cage_name
-            else:
-                na_real, nb_real = na, nb
+    # XY去重+Z深度优先：同一XY位置可能有多层平行面（外端面/内台阶面）
+    # 内台阶面是真正的装配基准面，depth_z更小 = 在法向反方向上更深
+    xy_best = {}  # (x10, y10) -> (score, ff, cage_cand, ml, mc, depth_z)
+    for score, ff, cage_cand, ml, mc in all_pairs:
+        x_key = round(cage_cand["c"][0] / 10) * 10
+        y_key = round(cage_cand["c"][1] / 10) * 10
+        xy = (x_key, y_key)
+        # depth_z = Z坐标沿法向的符号化深度（越小越靠内/越深）
+        n_sign = 1 if cage_cand["n"][2] > 0 else -1
+        depth_z = cage_cand["c"][2] * n_sign
+        if xy not in xy_best:
+            xy_best[xy] = (score, ff, cage_cand, ml, mc, depth_z)
+        else:
+            old_depth = xy_best[xy][5]
+            old_score = xy_best[xy][0]
+            # 深度差>2mm：明确是不同层 → 优先选内层（depth_z更小=更深）
+            if abs(depth_z - old_depth) > 2.0:
+                if depth_z < old_depth:
+                    xy_best[xy] = (score, ff, cage_cand, ml, mc, depth_z)
+            # 同层：按得分选
+            elif score > old_score:
+                xy_best[xy] = (score, ff, cage_cand, ml, mc, depth_z)
 
-            idx = idx_counter[0]
-            idx_counter[0] += 1
-            la, lb = planar_labels(m, na_real, nb_real, idx)
-            labels[na_real].append(la)
-            labels[nb_real].append(lb)
+    # 按得分降序，贪婪选择（每个物理位置只选一次）
+    dedup_pairs = sorted(xy_best.values(), key=lambda x: x[0], reverse=True)
+    kept_pairs = []
+    used_slots = set()
+    for score, ff, cage_cand, ml, mc, _depth_z in dedup_pairs:
+        x_key = round(cage_cand["c"][0] / 10) * 10
+        y_key = round(cage_cand["c"][1] / 10) * 10
+        if (x_key, y_key) in used_slots:
+            continue
+        used_slots.add((x_key, y_key))
+        kept_pairs.append((score, ff, cage_cand, ml, mc))
 
-            if na_real not in face_info:
-                face_info[na_real] = {"c": ff["c"], "n": ff["n"]}
-            if nb_real not in face_info:
-                face_info[nb_real] = {"c": cage_cand["c"], "n": cage_cand["n"]}
+    # 线性阵列过滤：只保留间距一致的槽位（踢出假阳性）
+    if len(kept_pairs) > 3:
+        cage_list = [cage_cand for _, _, cage_cand, _, _ in kept_pairs]
+        pts = sorted([(f["c"][0], f["c"][1], f, i) for i, f in enumerate(cage_list)])
+        best_subset = pts; best_count = 0
+        for i in range(len(pts)):
+            for j in range(i+3, len(pts)+1):
+                subset = pts[i:j]
+                xs = [p[0] for p in subset]
+                gaps = [xs[k+1]-xs[k] for k in range(len(xs)-1)]
+                if not gaps: continue
+                median_gap = sorted(gaps)[len(gaps)//2]
+                if median_gap < 5: continue
+                consistent = sum(1 for g in gaps if abs(g-median_gap) < max(median_gap*0.25, 10))
+                if consistent == len(gaps) and len(subset) > best_count:
+                    best_count = len(subset); best_subset = subset
+        if best_count >= 3:
+            kept_indices = {p[3] for p in best_subset}
+            kept_pairs = [p for i, p in enumerate(kept_pairs) if i in kept_indices]
 
-            print(f"  [{idx}] {na_real}<->{nb_real}: {len(mc)}c+{len(ml)}l"
-                  f" @({cage_cand['c'][0]:.0f},{cage_cand['c'][1]:.0f}) [FRAME-IN-FRAME]")
-            found_any = True
+    # 生成标签
+    for score, ff, cage_cand, ml, mc in kept_pairs:
+        t = len(mc) + len(ml)
+        m = {"fa": ff, "fb": cage_cand, "mc": mc, "ml": ml, "t": t}
+        if fan_name != na:
+            na_real, nb_real = fan_name, cage_name
+        else:
+            na_real, nb_real = na, nb
 
-        break  # 只用第一个匹配的FAN框架面
+        idx = idx_counter[0]
+        idx_counter[0] += 1
+        la, lb = planar_labels(m, na_real, nb_real, idx)
+        # FAN xDir 用 CAGE 槽 xDir 投影（框架边框对齐）
+        cage_x = [lb["geometry"]["x"]["x"], lb["geometry"]["x"]["y"], lb["geometry"]["x"]["z"]]
+        fan_z = [la["geometry"]["z"]["x"], la["geometry"]["z"]["y"], la["geometry"]["z"]["z"]]
+        fan_x_aligned = _ortho(fan_z, cage_x)
+        la["geometry"]["x"] = fan_x_aligned["x"]
+        la["geometry"]["y"] = fan_x_aligned["y"]
+
+        labels[na_real].append(la)
+        labels[nb_real].append(lb)
+
+        # 锁定CAGE槽位
+        used_p.setdefault(nb_real, set()).add(_fk_face(cage_cand))
+        if na_real not in face_info:
+            face_info[na_real] = {"c": ff["c"], "n": ff["n"]}
+        if nb_real not in face_info:
+            face_info[nb_real] = {"c": cage_cand["c"], "n": cage_cand["n"]}
+
+        # 记录CAGE槽位中心（均在CAGE CS内），供Step3圆柱过滤用
+        # frame_size用匹配到的CAGE框架最短边长估算
+        cage_lines = cage_cand.get("lines", [])
+        frame_edges = sorted([l["len"] for l in cage_lines], reverse=True)[:4]
+        frame_size = min(frame_edges) if len(frame_edges) >= 4 else 30.0
+        fif_slot_centers.setdefault(cage_name, []).append(
+            (cage_cand["c"][0], cage_cand["c"][1], frame_size))
+
+        print(f"  [{idx}] {na_real}<->{nb_real}: {len(mc)}c+{len(ml)}l"
+              f" @({cage_cand['c'][0]:.0f},{cage_cand['c'][1]:.0f}) [FRAME-IN-FRAME]")
+        found_any = True
 
 
 # ========== 主入口 ==========
@@ -444,9 +482,10 @@ def match_all(parts):
                 multi_cyl_pairs.append((names[i], names[j]))
 
     processed_fif = set()
+    fif_slot_centers = {}  # cage_name -> [(cx, cy, frame_size), ...] 均在CAGE CS内
     for na, nb in multi_cyl_pairs:
         before_labels = sum(len(labels[n]) for n in [na, nb])
-        _frame_in_frame(na, nb, parts, labels, idx, face_info, used_p)
+        _frame_in_frame(na, nb, parts, labels, idx, face_info, used_p, fif_slot_centers)
         after_labels = sum(len(labels[n]) for n in [na, nb])
         if after_labels > before_labels:
             processed_fif.add((na, nb))
@@ -589,17 +628,25 @@ def match_all(parts):
             ms = match_cylinders(ca, cb, strict_axis=strict,
                                  ref_a=(None if is_fif else ref_a),
                                  ref_b=(None if is_fif else ref_b))
-            # 框架嵌入对：CAGE侧圆柱的XY必须接近CAGE槽面中心（过滤跨列误匹配）
+            # 框架嵌入对：用CAGE槽位中心过滤（均在CAGE CS内），非FAN面中心（FAN CS内）
             if is_fif and ms:
                 cage_name = na if len(ca) > len(cb) else nb
-                fc = face_info[cage_name]["c"]
-                ms_filtered = []
-                for m in ms:
-                    cage_cyl = m["shaft"] if (m["shaft_in_a"] and na == cage_name) or (not m["shaft_in_a"] and nb == cage_name) else m["bore"]
-                    dxy = ((cage_cyl["mid"][0] - fc[0])**2 + (cage_cyl["mid"][1] - fc[1])**2)**0.5
-                    if dxy < 20:  # 20mm内才算同列
-                        ms_filtered.append(m)
-                ms = ms_filtered
+                fan_name = nb if len(ca) > len(cb) else na
+                slot_centers = fif_slot_centers.get(cage_name, [])
+                if slot_centers:
+                    ms_filtered = []
+                    for m in ms:
+                        cage_cyl = m["shaft"] if (m["shaft_in_a"] and na == cage_name) or (not m["shaft_in_a"] and nb == cage_name) else m["bore"]
+                        cx, cy = cage_cyl["mid"][0], cage_cyl["mid"][1]
+                        # 对每个圆柱，检查是否在任一匹配槽位的范围内
+                        for scx, scy, frame_size in slot_centers:
+                            dxy = ((cx - scx)**2 + (cy - scy)**2)**0.5
+                            # 自适应阈值：基于框架最短边长的0.7倍（螺栓孔在边框附近）
+                            threshold = max(frame_size * 0.7, 15.0)
+                            if dxy < threshold:
+                                ms_filtered.append(m)
+                                break
+                    ms = ms_filtered
             if ms: cyl_pairs.append((na, nb, ms))
 
     def _ck(cyl):
