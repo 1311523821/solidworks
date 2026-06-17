@@ -327,6 +327,35 @@ def _frame_in_frame(na, nb, parts, labels, idx_counter, face_info, used_p, fif_s
     def _check_fit(fan_face, cage_face):
         return fan_face["n"][2] * cage_face["n"][2] < -0.25
 
+    # 合并共线碎段线：将同方向相邻短线段重组长边
+    def _merge_fragments(lines, center, angle_bin=0.15, prox_tol=3.0):
+        if len(lines) < 4:
+            return lines
+        by_dir = {}
+        for l in lines:
+            if l["len"] < 1.0:  # skip tiny edges
+                continue
+            dx = l["m"][0] - center[0]
+            dy = l["m"][1] - center[1]
+            ang = round(math.atan2(dy, dx) / angle_bin) * angle_bin
+            by_dir.setdefault(ang, []).append(l)
+        merged = []
+        for ang, group in by_dir.items():
+            # sort by position along direction
+            cos_a, sin_a = math.cos(ang), math.sin(ang)
+            group.sort(key=lambda l: l["m"][0]*cos_a + l["m"][1]*sin_a)
+            cur_len = 0.0; cur_m = [0.0, 0.0, 0.0]; count = 0
+            for l in group:
+                cur_len += l["len"]
+                for k in range(3):
+                    cur_m[k] += l["m"][k] * l["len"]
+                count += 1
+            if cur_len > 0 and count >= 1:
+                for k in range(3):
+                    cur_m[k] /= cur_len
+                merged.append({"len": round(cur_len, 3), "m": cur_m})
+        return merged
+
     found_any = False
     # 收集所有 (fan_frame, cage_slot) 匹配对，然后贪婪选择+阵列过滤
     all_pairs = []  # (score, fan_frame, cage_cand, ml, mc)
@@ -336,11 +365,23 @@ def _frame_in_frame(na, nb, parts, labels, idx_counter, face_info, used_p, fif_s
             fn = cq.Vector(fan_frame["n"][0], fan_frame["n"][1], fan_frame["n"][2])
             if fn.z * cn.z > -0.25:
                 continue
-            ml = _match_lines_spatial(fan_frame.get("lines", []), f.get("lines", []),
+            fan_lines = fan_frame.get("lines", [])
+            cage_lines = f.get("lines", [])
+            ml = _match_lines_spatial(fan_lines, cage_lines,
                                       fan_frame["c"], f["c"], len_tol=5.0)
-            # 回退：线碎段化导致长度不匹配，放宽长度公差重试
+            # 回退1：线碎段化→放宽长度公差
             if len(ml) < 2:
-                ml = _match_lines_spatial(fan_frame.get("lines", []), f.get("lines", []),
+                ml = _match_lines_spatial(fan_lines, cage_lines,
+                                          fan_frame["c"], f["c"], len_tol=999.0)
+            # 回退2：合并共线碎段后重试
+            if len(ml) < 2:
+                fan_merged = _merge_fragments(fan_lines, fan_frame["c"])
+                cage_merged = _merge_fragments(cage_lines, f["c"])
+                ml = _match_lines_spatial(fan_merged, cage_merged,
+                                          fan_frame["c"], f["c"], len_tol=5.0)
+            # 回退2：合并共线碎段 + len_tol=999
+            if len(ml) < 2:
+                ml = _match_lines_spatial(fan_merged, cage_merged,
                                           fan_frame["c"], f["c"], len_tol=999.0)
             if len(ml) < 1:
                 continue
@@ -363,19 +404,20 @@ def _frame_in_frame(na, nb, parts, labels, idx_counter, face_info, used_p, fif_s
         x_key = round(cage_cand["c"][0] / 10) * 10
         y_key = round(cage_cand["c"][1] / 10) * 10
         xy = (x_key, y_key)
-        n_sign = 1 if cage_cand["n"][2] > 0 else -1
-        depth_z = cage_cand["c"][2] * n_sign
+        # 深度方向依赖FAN面法向：前面(nZ=+1)配天花板→选Z更大(更靠近CAGE顶)
+        # 背面(nZ=-1)配地板→选Z更小(更深入槽底)
+        depth_z = -cage_cand["c"][2] * fn.z
         body_off = abs(fan_centroid.z - ff["c"][2])  # 面心到质心距离=体不对称度
         if xy not in xy_best:
             xy_best[xy] = (score, ff, cage_cand, ml, mc, body_off, depth_z)
         else:
             old_score, _, _, _, _, old_body, old_depth = xy_best[xy]
-            # 不同FAN面(body_off差>5mm) → body_off大的优先
+            # 不同FAN面(body_off差>5mm) → body_off大的优先(主体偏向一侧=正确配合面)
             if abs(body_off - old_body) > 5:
                 if body_off > old_body:
                     xy_best[xy] = (score, ff, cage_cand, ml, mc, body_off, depth_z)
-            # 同FAN面 → Z深度优先(同法向符号可比)
-            elif abs(depth_z - old_depth) > 2.0:
+            # 同FAN面 → Z深度优先(0.5mm分层)
+            elif abs(depth_z - old_depth) > 0.5:
                 if depth_z < old_depth:
                     xy_best[xy] = (score, ff, cage_cand, ml, mc, body_off, depth_z)
             # 同层 → 得分优先
@@ -432,6 +474,13 @@ def _frame_in_frame(na, nb, parts, labels, idx_counter, face_info, used_p, fif_s
         fan_x_aligned = _ortho(fan_z, cage_x)
         la["geometry"]["x"] = fan_x_aligned["x"]
         la["geometry"]["y"] = fan_x_aligned["y"]
+
+        # Z修正：使FAN前端对齐CAGE槽口最高面(外法兰)
+        cage_top_z = max((f["c"][2] for f in cage_slots
+                          if abs(f["c"][0]-cage_cand["c"][0])<5
+                          and abs(f["c"][1]-cage_cand["c"][1])<5), default=cage_cand["c"][2])
+        fan_world_top = cage_cand["c"][2] + (fan_bb.zmax - ff["c"][2])
+        la["geometry"]["origin"]["z"] += (fan_world_top - cage_top_z)
 
         labels[na_real].append(la)
         labels[nb_real].append(lb)
