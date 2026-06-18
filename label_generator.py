@@ -100,8 +100,11 @@ def cylinder_labels(m, na, nb, idx, bore_origin=None, shaft_x=None, bore_x=None,
     return out[na], out[nb]
 
 
-def fmt_json(lst):
-    return {"modelAnnotation": {"parameters": {},
+def fmt_json(lst, world_step=None):
+    result = {"modelAnnotation": {"parameters": {},
         "features": {"featurePoints": [], "featureLines": [], "featurePlanes": [],
                      "featureCoordSyses": lst, "featureSurfaces": [], "featureBodies": []},
         "children": []}}
+    if world_step:
+        result["modelAnnotation"]["worldStep"] = world_step
+    return result

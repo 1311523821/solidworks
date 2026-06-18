@@ -506,10 +506,11 @@ def _frame_in_frame(na, nb, parts, labels, idx_counter, face_info, used_p, fif_s
 
 
 # ========== 主入口 ==========
-def match_all(parts):
+def match_all(parts, world_step=None):
     """
     parts: {name: {"features": {...}, "shape_path": "..."}}
-    返回: (labels_by_part, stats)
+    world_step: 可选，指定作为世界坐标参考的零件名（该零件在装配时保持静止）
+    返回: labels_by_part
     """
     names = list(parts.keys())
     labels = {n: [] for n in names}
@@ -758,7 +759,29 @@ def match_all(parts):
 
 
 if __name__ == "__main__":
-    target = sys.argv[1] if len(sys.argv) > 1 else "./2"
+    import os as _os
+    # 解析 CLI: [folder] [--world-step <name>]
+    target = "./2"
+    world_step_arg = None
+    skip_next = False
+    for i, a in enumerate(sys.argv[1:], 1):
+        if skip_next:
+            skip_next = False
+            continue
+        if a == '--world-step' and i + 1 < len(sys.argv):
+            world_step_arg = sys.argv[i + 1]
+            skip_next = True
+        elif not a.startswith('--'):
+            target = a
+
+    # 解析零件名
+    def _resolve_part(name_hint, names):
+        hint = _os.path.splitext(name_hint)[0]
+        if hint in names: return hint
+        matches = [n for n in names if hint.lower() in n.lower()]
+        if len(matches) == 1: return matches[0]
+        return None
+
     parts = {}
     for fp in os.listdir(target):
         if not (fp.endswith(".step") or fp.endswith(".stp")): continue
@@ -771,9 +794,18 @@ if __name__ == "__main__":
         parts[nm] = {"features": json.load(open(feat_path, encoding="utf-8")),
                      "shape_path": os.path.join(target, fp)}
 
-    labels = match_all(parts)
+    # 解析 world_step（需先有 parts 才有 names）
+    world_step = None
+    if world_step_arg:
+        world_step = _resolve_part(world_step_arg, list(parts.keys()))
+        if world_step:
+            print(f"world-step: {world_step}")
+        else:
+            print(f"  [warn] --world-step '{world_step_arg}' 未找到匹配零件，忽略")
+
+    labels = match_all(parts, world_step=world_step)
     for nm, lst in labels.items():
         out_path = os.path.join(target, f"{nm}_label.json")
         with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(fmt_json(lst), f, indent=2)
+            json.dump(fmt_json(lst, world_step=world_step), f, indent=2)
         print(f"  [OK] {nm}_label.json ({len(lst)} labels)")

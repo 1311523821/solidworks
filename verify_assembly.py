@@ -18,15 +18,21 @@ def build_loc(geo):
 
 # ---- load parts & labels ----
 parts = {}; names = []
+world_step = None  # from label metadata
 for fp in sorted(set(os.path.normpath(f) for f in
     glob.glob(os.path.join(folder, "*.step")) + glob.glob(os.path.join(folder, "*.stp"))
     if "virtual" not in os.path.basename(f))):
     nm = os.path.splitext(os.path.basename(fp))[0]
     jp = os.path.join(folder, f"{nm}_label.json")
     if not os.path.exists(jp): continue
-    systs = json.load(open(jp, encoding="utf-8"))["modelAnnotation"]["features"]["featureCoordSyses"]
+    data = json.load(open(jp, encoding="utf-8"))
+    systs = data["modelAnnotation"]["features"]["featureCoordSyses"]
     parts[nm] = {"shape": importers.importStep(fp).val(), "labels": systs}
     names.append(nm)
+    # 读取标签中的 worldStep 元数据（由 feature_matcher 写入）
+    ws = data.get("modelAnnotation", {}).get("worldStep")
+    if ws and not world_step:
+        world_step = ws
 
 # ---- group labels by mating ID ----
 groups = {}
@@ -38,27 +44,33 @@ for nm in names:
 print(f"=== verify_assembly: {os.path.basename(folder)} ===")
 print(f"parts: {names}  groups: {len(groups)}")
 
-# ---- pick anchor: part connected to most OTHER parts (highest degree in group graph)
-degree = {nm: set() for nm in names}
-for gid, items in groups.items():
-    for n1, _ in items:
-        for n2, _ in items:
-            if n1 != n2:
-                degree[n1].add(n2)
-anchor = max(names, key=lambda nm: (len(degree[nm]),
-    sum(1 for l in parts[nm]["labels"] if l.get("userData",{}).get("matchType")=="CYLINDER"
-        and not l.get("userData",{}).get("boreToBore")),
-    # fewer bore-bore labels = more likely a hub (shaft), not a flange
-    -sum(1 for l in parts[nm]["labels"] if l.get("userData",{}).get("boreToBore"))))
+# ---- pick anchor ----
+if world_step and world_step in names:
+    anchor = world_step
+    print(f"world-step: {anchor} (来自标签元数据)")
+else:
+    degree = {nm: set() for nm in names}
+    for gid, items in groups.items():
+        for n1, _ in items:
+            for n2, _ in items:
+                if n1 != n2:
+                    degree[n1].add(n2)
+    anchor = max(names, key=lambda nm: (len(degree[nm]),
+        sum(1 for l in parts[nm]["labels"] if l.get("userData",{}).get("matchType")=="CYLINDER"
+            and not l.get("userData",{}).get("boreToBore")),
+        -sum(1 for l in parts[nm]["labels"] if l.get("userData",{}).get("boreToBore"))))
 print(f"anchor: {anchor}")
 
 # ---- BFS placement ----
-target = cq.Location(cq.Plane(origin=cq.Vector(0,0,0), xDir=cq.Vector(1,0,0), normal=cq.Vector(0,0,1)))
+identity = cq.Location(cq.Plane(origin=cq.Vector(0,0,0), xDir=cq.Vector(1,0,0), normal=cq.Vector(0,0,1)))
 world = {}
 placed = set()
 
-# place anchor using its first label
-world[anchor] = target * build_loc(parts[anchor]["labels"][0]["geometry"]).inverse
+# 如果标签中指定了 worldStep，该零件使用 identity（静止不动）
+if world_step and world_step in names:
+    world[anchor] = identity
+else:
+    world[anchor] = identity * build_loc(parts[anchor]["labels"][0]["geometry"]).inverse
 placed.add(anchor)
 
 # BFS: repeatedly find a group with one placed part, place the other
@@ -96,21 +108,17 @@ for gid, items in groups.items():
     ud = l1.get("userData", {})
     if ud.get("matchType") != "PLANAR": continue
     key = tuple(sorted([n1, n2]))
-    if pair_counts.get(key, 0) <= 1: continue  # only one label → already placed
+    if pair_counts.get(key, 0) <= 1: continue
     if n1 not in placed or n2 not in placed: continue
 
-    # skip the primary placement label (first one used in BFS)
-    # determine which label was used for primary placement by checking if the
-    # dest part's current world position matches this label pair
     s_name, d_name = n1, n2
     s_lbl, d_lbl = l1, l2
 
-    # compute what world[d_name] would be if placed via THIS label
     alt_world = world[s_name] * build_loc(s_lbl["geometry"]) * build_loc(d_lbl["geometry"]).inverse
     primary_pos = world[d_name].wrapped.Transformation().TranslationPart()
     alt_pos = alt_world.wrapped.Transformation().TranslationPart()
     if abs(primary_pos.X() - alt_pos.X()) < 0.01 and abs(primary_pos.Y() - alt_pos.Y()) < 0.01 and abs(primary_pos.Z() - alt_pos.Z()) < 0.01:
-        continue  # this IS the primary label, skip
+        continue
 
     inst_name = f"{d_name}@{gid}"
     instances.append((parts[d_name]["shape"], alt_world, inst_name))
@@ -133,8 +141,9 @@ for shape, loc, name in instances:
     assembly.add(shape.located(loc), name=name, color=palette[i % len(palette)])
     i += 1
 
-out_glb = os.path.join(folder, "virtual_assembly_test.glb")
-out_step = os.path.join(folder, "virtual_assembly_test.step")
+suffix = "_world_step" if world_step else ""
+out_glb = os.path.join(folder, f"virtual_assembly_test{suffix}.glb")
+out_step = os.path.join(folder, f"virtual_assembly_test{suffix}.step")
 assembly.save(out_glb)
 assembly.export(out_step, exportType="STEP")
 print(f"saved: {out_glb}")

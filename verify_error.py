@@ -1,6 +1,6 @@
 """
 装配误差验证 — 只检查关键配合特征
-用法: python verify_error.py ./2
+用法: python verify_error.py ./2 [--world-step <name>]
 """
 import os, sys, json, math
 import cadquery as cq
@@ -32,16 +32,21 @@ print(f"  装配误差验证: {os.path.basename(folder)}")
 print(f"{'='*60}")
 
 # Load
-parts = {}; names = []
+parts = {}; names = []; world_step = None
 for fp in sorted(os.listdir(folder)):
     if not (fp.endswith(".step") or fp.endswith(".stp")): continue
     if "virtual" in fp: continue
     nm = os.path.splitext(os.path.basename(fp))[0]
     jp = os.path.join(folder, f"{nm}_label.json")
     if not os.path.exists(jp): continue
-    systs = json.load(open(jp, encoding="utf-8"))["modelAnnotation"]["features"]["featureCoordSyses"]
+    data = json.load(open(jp, encoding="utf-8"))
+    systs = data["modelAnnotation"]["features"]["featureCoordSyses"]
     parts[nm] = {"labels": systs}
     names.append(nm)
+    # 读取 worldStep 元数据
+    ws = data.get("modelAnnotation", {}).get("worldStep")
+    if ws and not world_step:
+        world_step = ws
 
 # Groups
 groups = {}
@@ -51,22 +56,26 @@ for nm in names:
         groups.setdefault(gid, []).append((nm, l))
 
 # ---- Assembly (same logic as verify_assembly.py) ----
-target = cq.Location(cq.Plane(origin=cq.Vector(0,0,0), xDir=cq.Vector(1,0,0), normal=cq.Vector(0,0,1)))
-anchor = names[0]; anchor_score = 0
-for nm in names:
-    n_planar = sum(1 for l in parts[nm]["labels"] if l.get("userData",{}).get("matchType")=="PLANAR")
-    if n_planar > anchor_score: anchor_score = n_planar; anchor = nm
-best_t = -1
-for nm in names:
-    for l in parts[nm]["labels"]:
-        ud = l.get("userData", {})
-        if ud.get("matchType") == "PLANAR" and ud.get("total", 0) > best_t:
-            best_t = ud["total"]; fallback = nm
-if fallback != anchor:
-    n_fb = sum(1 for l in parts[fallback]["labels"] if l.get("userData",{}).get("matchType")=="PLANAR")
-    if n_fb >= anchor_score: anchor = fallback
+identity = cq.Location(cq.Plane(origin=cq.Vector(0,0,0), xDir=cq.Vector(1,0,0), normal=cq.Vector(0,0,1)))
 
-world = {anchor: target * build_loc(parts[anchor]["labels"][0]["geometry"]).inverse}
+if world_step and world_step in names:
+    anchor = world_step
+    world = {anchor: identity}
+else:
+    anchor = names[0]; anchor_score = 0
+    for nm in names:
+        n_planar = sum(1 for l in parts[nm]["labels"] if l.get("userData",{}).get("matchType")=="PLANAR")
+        if n_planar > anchor_score: anchor_score = n_planar; anchor = nm
+    best_t = -1
+    for nm in names:
+        for l in parts[nm]["labels"]:
+            ud = l.get("userData", {})
+            if ud.get("matchType") == "PLANAR" and ud.get("total", 0) > best_t:
+                best_t = ud["total"]; fallback = nm
+    if fallback != anchor:
+        n_fb = sum(1 for l in parts[fallback]["labels"] if l.get("userData",{}).get("matchType")=="PLANAR")
+        if n_fb >= anchor_score: anchor = fallback
+    world = {anchor: identity * build_loc(parts[anchor]["labels"][0]["geometry"]).inverse}
 placed = {anchor}
 
 # Phase 1
