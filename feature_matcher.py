@@ -424,9 +424,19 @@ def _frame_in_frame(na, nb, parts, labels, idx_counter, face_info, used_p, fif_s
             elif score > old_score:
                 xy_best[xy] = (score, ff, cage_cand, ml, mc, body_off, depth_z)
 
-    # 只保留最佳 1 个槽位
+    # 只保留最佳 1 个槽位；按 Y 聚类取最大组 → 线性阵列确认
     dedup_pairs = sorted(xy_best.values(), key=lambda x: x[0], reverse=True)
     kept_pairs = [dedup_pairs[0]] if dedup_pairs else []
+    if len(dedup_pairs) >= 3:
+        # 按 Y 坐标聚类（同行的槽位），取最大的一组
+        y_groups = {}
+        for _, _, cage_cand, _, _, _, _ in dedup_pairs:
+            y10 = round(cage_cand["c"][1] / 10) * 10
+            y_groups.setdefault(y10, []).append(cage_cand)
+        largest_group = max(y_groups.values(), key=len)
+        if len(largest_group) >= 3 and _is_linear_array(largest_group, axis=0):
+            print(f"  [ARRAY] {fan_name}<->{cage_name}: {len(largest_group)} of "
+                  f"{len(dedup_pairs)} slots form linear array (selected best 1)")
 
     # 生成标签
     for score, ff, cage_cand, ml, mc, _bo, _dz in kept_pairs:
@@ -700,8 +710,12 @@ def match_all(parts, world_step=None):
             valid.append(m)
         if not valid: continue
 
-        # 按 t 降序排列
-        valid.sort(key=lambda m: m["t"], reverse=True)
+        # 排序：t 得分 + 圆周阵列加权（螺栓孔面优先）
+        def _score(m):
+            bonus = 100 if (_is_circular_array(m["fa"])
+                        and _is_circular_array(m["fb"])) else 0
+            return m["t"] + bonus
+        valid.sort(key=_score, reverse=True)
         primary = valid[0]
 
         # 法向多样性：>30° 的视为不同接触面（如键的底面+侧壁），保留最多3个
