@@ -424,40 +424,12 @@ def _frame_in_frame(na, nb, parts, labels, idx_counter, face_info, used_p, fif_s
             elif score > old_score:
                 xy_best[xy] = (score, ff, cage_cand, ml, mc, body_off, depth_z)
 
-    # 按得分降序，贪婪选择（每个物理位置只选一次）
+    # 只保留最佳 1 个槽位
     dedup_pairs = sorted(xy_best.values(), key=lambda x: x[0], reverse=True)
-    kept_pairs = []
-    used_slots = set()
-    for score, ff, cage_cand, ml, mc, _bo, _dz in dedup_pairs:
-        x_key = round(cage_cand["c"][0] / 10) * 10
-        y_key = round(cage_cand["c"][1] / 10) * 10
-        if (x_key, y_key) in used_slots:
-            continue
-        used_slots.add((x_key, y_key))
-        kept_pairs.append((score, ff, cage_cand, ml, mc))
-
-    # 线性阵列过滤：只保留间距一致的槽位（踢出假阳性）
-    if len(kept_pairs) > 3:
-        cage_list = [cage_cand for _, _, cage_cand, _, _ in kept_pairs]
-        pts = sorted([(f["c"][0], f["c"][1], f, i) for i, f in enumerate(cage_list)])
-        best_subset = pts; best_count = 0
-        for i in range(len(pts)):
-            for j in range(i+3, len(pts)+1):
-                subset = pts[i:j]
-                xs = [p[0] for p in subset]
-                gaps = [xs[k+1]-xs[k] for k in range(len(xs)-1)]
-                if not gaps: continue
-                median_gap = sorted(gaps)[len(gaps)//2]
-                if median_gap < 5: continue
-                consistent = sum(1 for g in gaps if abs(g-median_gap) < max(median_gap*0.25, 10))
-                if consistent == len(gaps) and len(subset) > best_count:
-                    best_count = len(subset); best_subset = subset
-        if best_count >= 3:
-            kept_indices = {p[3] for p in best_subset}
-            kept_pairs = [p for i, p in enumerate(kept_pairs) if i in kept_indices]
+    kept_pairs = [dedup_pairs[0]] if dedup_pairs else []
 
     # 生成标签
-    for score, ff, cage_cand, ml, mc in kept_pairs:
+    for score, ff, cage_cand, ml, mc, _bo, _dz in kept_pairs:
         t = len(mc) + len(ml)
         m = {"fa": ff, "fb": cage_cand, "mc": mc, "ml": ml, "t": t}
         if fan_name != na:
@@ -505,6 +477,147 @@ def _frame_in_frame(na, nb, parts, labels, idx_counter, face_info, used_p, fif_s
         found_any = True
 
 
+# ========== 验证辅助函数 ==========
+
+def _vec(v):
+    """[x,y,z] → cq.Vector"""
+    return cq.Vector(v[0], v[1], v[2])
+
+
+def _xform_point(loc, vec):
+    """用 Location 变换点"""
+    from OCP.gp import gp_Pnt
+    trsf = loc.wrapped.Transformation()
+    p = gp_Pnt(vec.x, vec.y, vec.z)
+    return cq.Vector(p.Transformed(trsf).X(), p.Transformed(trsf).Y(), p.Transformed(trsf).Z())
+
+
+def _xform_dir(loc, vec):
+    """用 Location 变换方向向量"""
+    return _xform_point(loc, vec) - _xform_point(loc, cq.Vector(0, 0, 0))
+
+
+def _loc_from_origin_and_z(origin, z_dir, x_hint=None):
+    """从原点和z方向构建 cadquery.Location"""
+    z = cq.Vector(z_dir[0], z_dir[1], z_dir[2])
+    if x_hint:
+        ref = cq.Vector(x_hint[0], x_hint[1], x_hint[2])
+    else:
+        ref = cq.Vector(1, 0, 0) if abs(z.x) < 0.9 else cq.Vector(0, 1, 0)
+    x = ref - z * (ref.dot(z) / z.dot(z))
+    x = cq.Vector(1, 0, 0) if x.Length < 1e-9 else x.normalized()
+    return cq.Location(cq.Plane(origin=_vec(origin), xDir=x, normal=z))
+
+
+def _compute_cylinder_transform(m):
+    """从CYLINDER匹配dict计算 T_AB: A→B 的刚体变换"""
+    s, b = m["shaft"], m["bore"]
+    shaft_in_a = m.get("shaft_in_a", True)
+    if shaft_in_a:
+        loc_a = _loc_from_origin_and_z(s["mid"], s["dir"])
+        loc_b = _loc_from_origin_and_z(b["mid"], b["dir"])
+    else:
+        loc_a = _loc_from_origin_and_z(b["mid"], b["dir"])
+        loc_b = _loc_from_origin_and_z(s["mid"], s["dir"])
+    return loc_a * loc_b.inverse
+
+
+def _compute_planar_transform(m):
+    """从PLANAR匹配dict计算 T_AB: A→B 的刚体变换"""
+    fa, fb = m["fa"], m["fb"]
+    loc_a = _loc_from_origin_and_z(fa["c"], fa["n"])
+    loc_b = _loc_from_origin_and_z(fb["c"], _neg(fb["n"]))
+    return loc_a * loc_b.inverse
+
+
+def _verify_planar_consistency(kept_match, discarded_matches,
+                                tol_distance=5.0, tol_angle_deg=20.0):
+    """验证被丢弃的PLANAR匹配是否与kept产生相同的刚体变换。
+    如果两对面代表同一装配关系，变换应一致。
+    """
+    T_k = _compute_planar_transform(kept_match)
+    passed, total = 0, 0
+    for m in discarded_matches:
+        total += 1
+        T_d = _compute_planar_transform(m)
+        pt_a = _vec(m["fa"]["c"])
+        dist = (_xform_point(T_k, pt_a) - _xform_point(T_d, pt_a)).Length
+        n_a = _vec(m["fa"]["n"])
+        d_k = _xform_dir(T_k, n_a)
+        n_expected = _vec(_neg(m["fb"]["n"]))
+        if d_k.Length > 1e-9:
+            dot_v = max(-1.0, min(1.0, d_k.normalized().dot(n_expected.normalized())))
+            angle_deg = math.degrees(math.acos(abs(dot_v)))
+        else:
+            angle_deg = 0.0
+        ok = dist < tol_distance and angle_deg < tol_angle_deg
+        if ok: passed += 1
+    return passed, total
+
+
+def _verify_cylinder_consistency(kept_match, discarded_matches, tol_angle_deg=15.0):
+    """验证被丢弃的CYLINDER匹配的轴线方向是否与kept一致。
+
+    不同孔/轴位置不同是正常的（螺栓孔分布在法兰不同位置），
+    但它们应该共轴——轴线方向必须一致。
+    只比较方向，不比较位置。
+    """
+    T_k = _compute_cylinder_transform(kept_match)
+    passed, total = 0, 0
+    for m in discarded_matches:
+        total += 1
+        T_d = _compute_cylinder_transform(m)
+        s = m["shaft"]
+        d_a = _vec(s["dir"])
+        d_k = _xform_dir(T_k, d_a)
+        d_d = _xform_dir(T_d, d_a)
+        if d_k.Length > 1e-9 and d_d.Length > 1e-9:
+            dot_v = max(-1.0, min(1.0, d_k.normalized().dot(d_d.normalized())))
+            angle_deg = math.degrees(math.acos(abs(dot_v)))
+        else:
+            angle_deg = 0.0
+        ok = angle_deg < tol_angle_deg
+        if ok: passed += 1
+    return passed, total
+
+
+def _run_verification(discarded_planar, discarded_cylinder):
+    """用被丢弃的标签验证选中标签的正确性。
+    返回 {pair: {type: (passed, total, rate)}} 供回退决策使用。
+    """
+    results = {}; total_passed = 0; total_count = 0
+    lines = []
+
+    for (na, nb), (kept, discarded) in discarded_planar.items():
+        if kept is None: continue
+        passed, count = _verify_planar_consistency(kept, discarded)
+        total_passed += passed; total_count += count
+        if count > 0:
+            rate = passed / count
+            tag = " [OK]" if rate > 0.80 else (" [WARN]" if rate < 0.30 else "")
+            lines.append((na, nb, "PLANAR", passed, count, rate, tag))
+            results.setdefault((na, nb), {})["PLANAR"] = (passed, count, rate)
+
+    for (na, nb), (kept, discarded) in discarded_cylinder.items():
+        if kept is None: continue
+        passed, count = _verify_cylinder_consistency(kept, discarded)
+        total_passed += passed; total_count += count
+        if count > 0:
+            rate = passed / count
+            tag = " [OK]" if rate > 0.80 else (" [WARN]" if rate < 0.30 else "")
+            lines.append((na, nb, "CYL", passed, count, rate, tag))
+            results.setdefault((na, nb), {})["CYL"] = (passed, count, rate)
+
+    if total_count == 0:
+        return results
+
+    print(f"\n=== Verification: {total_passed}/{total_count} "
+          f"consistent ({total_passed/total_count:.1%}) ===")
+    for na, nb, mtype, passed, count, rate, tag in lines:
+        print(f"  {na}<->{nb} [{mtype}]: {passed}/{count} ({rate:.1%}){tag}")
+    return results
+
+
 # ========== 主入口 ==========
 def match_all(parts, world_step=None):
     """
@@ -521,6 +634,8 @@ def match_all(parts, world_step=None):
         return f"p|{c[0]:.4f}|{c[1]:.4f}|{c[2]:.4f}|{n[0]:.4f}|{n[1]:.4f}|{n[2]:.4f}"
 
     face_info = {}; used_p = {}; slot_faces = {}; face_csys = {}
+    discarded_planar_matches = {}  # {(na, nb): (kept_match, [discarded])}
+    pairs_with_labels = set()  # 已有标签的零件对，Step 3 跳过
     ky_name = next((n for n in names if "key" in n.lower()), None)
     sh_name = next((n for n in names if "shaft" in n.lower()), None)
 
@@ -541,6 +656,7 @@ def match_all(parts, world_step=None):
         after_labels = sum(len(labels[n]) for n in [na, nb])
         if after_labels > before_labels:
             processed_fif.add((na, nb))
+            pairs_with_labels.add((na, nb))
             print(f"  [OK] frame-in-frame: {after_labels - before_labels} new labels for {na}<->{nb}")
         else:
             print(f"  [warn] frame-in-frame failed for {na}<->{nb}, fallback to planar")
@@ -561,12 +677,11 @@ def match_all(parts, world_step=None):
     planar_pairs.sort(key=lambda x: x[2][0]["t"], reverse=True)
 
     for na, nb, ms in planar_pairs:
+        # 第一遍：收集所有通过检查的有效匹配
+        valid = []
         for m in ms:
             ka, kb = _fk(m["fa"]), _fk(m["fb"])
             if ka in used_p.get(na, set()) or kb in used_p.get(nb, set()): continue
-            used_p.setdefault(na, set()).add(ka)
-            used_p.setdefault(nb, set()).add(kb)
-            idx[0] += 1
             # outward check
             from cadquery import importers
             shape_a = importers.importStep(parts[na]["shape_path"]).val()
@@ -579,24 +694,51 @@ def match_all(parts, world_step=None):
             n_a = cq.Vector(m["fa"]["n"][0], m["fa"]["n"][1], m["fa"]["n"][2])
             n_b = cq.Vector(m["fb"]["n"][0], m["fb"]["n"][1], m["fb"]["n"][2])
             if fc_a.sub(bc_a).dot(n_a) < 0 or fc_b.sub(bc_b).dot(n_b) < 0: continue
-            # multi-hole filter
             ca = len(parts[na]["features"]["cylinders"])
             cb = len(parts[nb]["features"]["cylinders"])
-            # only filter if both faces are Z-dominant (same coordinate direction)
             if ca > 50 and cb > 50 and abs(n_a[2]) > 0.7 and abs(n_b[2]) > 0.7 and n_a[2]*n_b[2] < 0: continue
-            # 阵列加分：如果两面都有圆周阵列（螺栓法兰），提高标签优先级
+            valid.append(m)
+        if not valid: continue
+
+        # 按 t 降序排列
+        valid.sort(key=lambda m: m["t"], reverse=True)
+        primary = valid[0]
+
+        # 法向多样性：>30° 的视为不同接触面（如键的底面+侧壁），保留最多3个
+        kept = [primary]
+        for m in valid[1:]:
+            n_candidate = _vec(m["fa"]["n"])
+            is_new_face = True
+            for k in kept:
+                n_existing = _vec(k["fa"]["n"])
+                dot_v = max(-1.0, min(1.0, n_candidate.normalized().dot(n_existing.normalized())))
+                angle = math.degrees(math.acos(abs(dot_v)))
+                if angle < 30:
+                    is_new_face = False
+                    break
+            if is_new_face and len(kept) < 3:
+                kept.append(m)
+
+        # 生成标签：PRIMARY 输出到 JSON，SIDE 仅用于验证
+        for m in kept:
+            used_p.setdefault(na, set()).add(_fk(m["fa"]))
+            used_p.setdefault(nb, set()).add(_fk(m["fb"]))
+            is_primary = (m is primary)
+            if is_primary:
+                idx[0] += 1
             is_array_a = _is_circular_array(m["fa"])
             is_array_b = _is_circular_array(m["fb"])
             array_bonus = " [ARRAY]" if (is_array_a and is_array_b) else ""
-            print(f"  [{idx[0]}] {na} <-> {nb}: {len(m['mc'])}c+{len(m['ml'])}l{array_bonus}")
+            tag = " [PRIMARY]" if is_primary else " [SIDE-verify]"
+            print(f"  [{idx[0]}] {na} <-> {nb}: {len(m['mc'])}c+{len(m['ml'])}l{array_bonus}{tag}")
             la, lb = planar_labels(m, na, nb, idx[0])
-            # 记录面标签，供 Step 2 后用槽方向修正 xDir
             if "flange" in na.lower() and "flange" in nb.lower():
                 _flange_face_labels = getattr(match_all, '_flange_face_labels', None)
                 if _flange_face_labels is None:
                     match_all._flange_face_labels = []
                 match_all._flange_face_labels.append((na, nb, la, lb, m))
-            labels[na].append(la); labels[nb].append(lb)
+            if is_primary:
+                labels[na].append(la); labels[nb].append(lb)
             if na not in face_info:
                 face_info[na] = {"c": m["fa"]["c"], "n": m["fa"]["n"]}
                 face_csys[na] = {"c": m["fa"]["c"], "n": m["fa"]["n"],
@@ -605,7 +747,13 @@ def match_all(parts, world_step=None):
                 face_info[nb] = {"c": m["fb"]["c"], "n": m["fb"]["n"]}
                 face_csys[nb] = {"c": m["fb"]["c"], "n": m["fb"]["n"],
                                  "x": lb["geometry"]["x"], "y": lb["geometry"]["y"]}
-            break
+
+        pairs_with_labels.add((na, nb))
+
+        # 收集被丢弃的匹配用于验证
+        remaining = [m for m in valid if m not in kept]
+        if remaining:
+            discarded_planar_matches[(na, nb)] = (primary, remaining)
 
     # === Step 2: slot detection (store slot face positions for CYLINDER label xDir) ===
     if sh_name:
@@ -710,12 +858,29 @@ def match_all(parts, world_step=None):
         pair[2].sort(key=lambda m: m["shaft"]["r"], reverse=True)
 
     used_c = {}
-    used_sf = set()  # 去重 shaft-flange: 只保留一对
+    used_sf = set()
+    discarded_cylinder_matches = {}  # {(na, nb): (kept_match|None, [discarded])}
+
     for na, nb, ms in cyl_pairs:
-        for m in ms:
+        # 按 boreToBore 拆分：shaft-bore 优先用于装配
+        shaft_bore = [m for m in ms if not m.get("bore_to_bore", False)]
+        bore_to_bore = [m for m in ms if m.get("bore_to_bore", False)]
+
+        # 选择最佳 1 个：优先 shaft-bore（最大半径），fallback bore-to-bore
+        all_valid = shaft_bore + bore_to_bore
+        if all_valid:
+            discarded_cylinder_matches[(na, nb)] = (
+                all_valid[0], all_valid[1:])
+
+        # 已有 PLANAR/框架标签的零件对不再追加 CYLINDER 标签
+        if (na, nb) in pairs_with_labels:
+            continue
+
+        # 只为 kept 生成标签
+        kept_ms = [all_valid[0]] if all_valid else []
+        for m in kept_ms:
             s_has = na if m["shaft_in_a"] else nb
             b_has = nb if m["shaft_in_a"] else na
-            # 去重：shaft-flange 只保留第一个 CYLINDER 对（另一个 flange 通过 face 标签连接）
             is_sf = (sh_name and (s_has == sh_name or b_has == sh_name)
                      and any("flange" in x for x in (na, nb)))
             if is_sf:
@@ -726,24 +891,19 @@ def match_all(parts, world_step=None):
             if kb in used_c.get(b_has, set()): continue
             used_c.setdefault(b_has, set()).add(kb)
             s_cyl = m["shaft"]; b_cyl = m["bore"]
-            # 各自 CS 内计算投影点（绝不跨 CS 混合）
             bore_pt = None; shaft_pt = None
             if b_has in face_info:
                 bore_pt = _bore_face_intersection(m["bore"], face_info[b_has])
             if s_has in face_info:
                 shaft_pt = _bore_face_intersection(m["shaft"], face_info[s_has])
-            # shaft-flange: 将轴的 keyway 面心投影到轴线上（均在轴的CS内），
-            # 使 flange keyway 与 shaft keyway 沿轴向对齐
             if is_sf and s_has in face_info:
-                fc_s = face_info[s_has]["c"]  # shaft keyway 面心（轴的 CS）
+                fc_s = face_info[s_has]["c"]
                 sd = cq.Vector(s_cyl["dir"][0], s_cyl["dir"][1], s_cyl["dir"][2])
                 sm = cq.Vector(s_cyl["mid"][0], s_cyl["mid"][1], s_cyl["mid"][2])
                 fc_v = cq.Vector(fc_s[0], fc_s[1], fc_s[2])
-                # keyway 面心沿轴方向投影到轴线上（轴的 CS 内）
                 proj = fc_v.sub(sm).dot(sd)
                 shaft_pt = [sm.x + sd.x*proj, sm.y + sd.y*proj, sm.z + sd.z*proj]
             s_x = None; b_x = None
-            # 仅 shaft-flange 对使用 slot xDir（bore-bore 不需要）
             if is_sf:
                 if s_has in slot_faces:
                     s_x = _vec_sub(slot_faces[s_has], s_cyl["mid"])
@@ -754,6 +914,115 @@ def match_all(parts, world_step=None):
             print(f"  [{idx[0]}] {na}<->{nb}: R={m['shaft']['r']:.2f}{slot_note}")
             la, lb = cylinder_labels(m, na, nb, idx[0], bore_pt, s_x, b_x, shaft_pt)
             labels[na].append(la); labels[nb].append(lb)
+
+    # === Step 4: 用被丢弃的标签验证选中标签的正确性 ===
+    verify_results = _run_verification(discarded_planar_matches, discarded_cylinder_matches)
+
+    # === Step 4b: 验证失败 → 从丢弃的候选中寻找替代 ===
+    for (na, nb), vdata in verify_results.items():
+        cyl = vdata.get("CYL")
+        if cyl is None: continue
+        _, _, cyl_rate = cyl
+        if cyl_rate >= 0.50: continue  # 验证通过
+
+        cyl_info = discarded_cylinder_matches.get((na, nb))
+        if cyl_info is None: continue
+        best_cyl_ref, other_cyls = cyl_info
+
+        # 候选序列：其他 PLANAR → 其他 CYL（除 boreToBore）
+        candidates = []
+        planar_info = discarded_planar_matches.get((na, nb))
+        if planar_info:
+            _, discarded_pl = planar_info
+            # 按 t 降序排列
+            discarded_pl_sorted = sorted(discarded_pl, key=lambda m: m["t"], reverse=True)
+            for m in discarded_pl_sorted:
+                candidates.append(("PLANAR", m))
+        for m in other_cyls:
+            if not m.get("bore_to_bore", False):
+                candidates.append(("CYL", m))
+        if best_cyl_ref and not best_cyl_ref.get("bore_to_bore", False):
+            candidates.append(("CYL", best_cyl_ref))
+
+        found = False
+        for cand_type, cand_match in candidates:
+            # 用该候选的变换验证 CYL 一致性
+            if cand_type == "PLANAR":
+                verify_ref = [best_cyl_ref] if best_cyl_ref else []
+                verify_ref += [m for m in other_cyls if not m.get("bore_to_bore", False)]
+                if not verify_ref:
+                    verify_ref = [m for m in other_cyls]  # fallback to boreToBore
+                # 检查该 PLANAR 候选与所有 CYL 的轴线一致性
+                all_ok = True
+                T_cand = _compute_planar_transform(cand_match)
+                for cyl_m in verify_ref:
+                    T_cyl = _compute_cylinder_transform(cyl_m)
+                    s = cyl_m["shaft"]
+                    d_a = _vec(s["dir"])
+                    d_cand = _xform_dir(T_cand, d_a)
+                    d_cyl = _xform_dir(T_cyl, d_a)
+                    if d_cand.Length > 1e-9 and d_cyl.Length > 1e-9:
+                        dot_v = max(-1.0, min(1.0,
+                            d_cand.normalized().dot(d_cyl.normalized())))
+                        angle = math.degrees(math.acos(abs(dot_v)))
+                        if angle > 15.0:
+                            all_ok = False
+                            break
+                if all_ok:
+                    found = True
+                    break
+            else:  # CYL candidate
+                # CYL 候选：检查与其他 CYL 的一致性
+                if best_cyl_ref and cand_match is not best_cyl_ref:
+                    T_cand = _compute_cylinder_transform(cand_match)
+                    T_ref = _compute_cylinder_transform(best_cyl_ref)
+                    s = cand_match["shaft"]
+                    d_a = _vec(s["dir"])
+                    d_cand = _xform_dir(T_cand, d_a)
+                    d_ref = _xform_dir(T_ref, d_a)
+                    if d_cand.Length > 1e-9 and d_ref.Length > 1e-9:
+                        dot_v = max(-1.0, min(1.0,
+                            d_cand.normalized().dot(d_ref.normalized())))
+                        angle = math.degrees(math.acos(abs(dot_v)))
+                        if angle < 15.0:
+                            found = True
+                            break
+                else:
+                    found = True
+                    break
+
+        if not found: continue
+
+        # 找到替代 → 移除旧 PLANAR，生成新标签
+        planar_ids = set()
+        for nm in (na, nb):
+            for l in labels[nm]:
+                if l.get("userData", {}).get("matchType") == "PLANAR":
+                    gid = l["identifier"].rsplit("_Mating_", 1)[1] if "_Mating_" in l["identifier"] else ""
+                    if gid: planar_ids.add(gid)
+        for gid in planar_ids:
+            for nm in (na, nb):
+                labels[nm] = [l for l in labels[nm]
+                              if not l["identifier"].endswith(f"_Mating_{gid}")]
+            break
+
+        idx[0] += 1
+        if cand_type == "PLANAR":
+            print(f"  [FALLBACK] {na}<->{nb}: try next PLANAR (t={cand_match['t']}, "
+                  f"CYL verify={cyl_rate:.0%})")
+            la, lb = planar_labels(cand_match, na, nb, idx[0])
+        else:
+            s_cyl = cand_match["shaft"]; b_cyl = cand_match["bore"]
+            s_has = na if cand_match["shaft_in_a"] else nb
+            b_has = nb if cand_match["shaft_in_a"] else na
+            bore_pt = (_bore_face_intersection(b_cyl, face_info[b_has])
+                       if b_has in face_info else None)
+            shaft_pt = (_bore_face_intersection(s_cyl, face_info[s_has])
+                        if s_has in face_info else None)
+            print(f"  [FALLBACK] {na}<->{nb}: PLANAR→CYL (R={s_cyl['r']:.2f}, "
+                  f"CYL verify={cyl_rate:.0%})")
+            la, lb = cylinder_labels(cand_match, na, nb, idx[0], bore_pt, None, None, shaft_pt)
+        labels[na].append(la); labels[nb].append(lb)
 
     return labels
 

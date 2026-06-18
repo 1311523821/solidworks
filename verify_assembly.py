@@ -92,38 +92,6 @@ while len(placed) < len(parts):
 
 print(f"placed: {list(placed)}")
 
-# ---- multi-instance: 多个 PLANAR 标签 = 同一零件对的多个实例 ----
-pair_counts = {}
-for gid, items in groups.items():
-    if len(items) != 2: continue
-    n1, l1 = items[0]; n2, l2 = items[1]
-    if l1.get("userData", {}).get("matchType") != "PLANAR": continue
-    key = tuple(sorted([n1, n2]))
-    pair_counts[key] = pair_counts.get(key, 0) + 1
-
-instances = []
-for gid, items in groups.items():
-    if len(items) != 2: continue
-    n1, l1 = items[0]; n2, l2 = items[1]
-    ud = l1.get("userData", {})
-    if ud.get("matchType") != "PLANAR": continue
-    key = tuple(sorted([n1, n2]))
-    if pair_counts.get(key, 0) <= 1: continue
-    if n1 not in placed or n2 not in placed: continue
-
-    s_name, d_name = n1, n2
-    s_lbl, d_lbl = l1, l2
-
-    alt_world = world[s_name] * build_loc(s_lbl["geometry"]) * build_loc(d_lbl["geometry"]).inverse
-    primary_pos = world[d_name].wrapped.Transformation().TranslationPart()
-    alt_pos = alt_world.wrapped.Transformation().TranslationPart()
-    if abs(primary_pos.X() - alt_pos.X()) < 0.01 and abs(primary_pos.Y() - alt_pos.Y()) < 0.01 and abs(primary_pos.Z() - alt_pos.Z()) < 0.01:
-        continue
-
-    inst_name = f"{d_name}@{gid}"
-    instances.append((parts[d_name]["shape"], alt_world, inst_name))
-    print(f"  instance: {inst_name}")
-
 # ---- visualize ----
 palette = [
     cq.Color(0.85, 0.20, 0.20, 0.6), cq.Color(0.20, 0.65, 0.85, 0.6),
@@ -137,9 +105,6 @@ for nm in names:
     if nm not in world: continue
     assembly.add(parts[nm]["shape"].located(world[nm]), name=nm, color=palette[i % len(palette)])
     i += 1
-for shape, loc, name in instances:
-    assembly.add(shape.located(loc), name=name, color=palette[i % len(palette)])
-    i += 1
 
 suffix = "_world_step" if world_step else ""
 out_glb = os.path.join(folder, f"virtual_assembly_test{suffix}.glb")
@@ -148,4 +113,4 @@ assembly.save(out_glb)
 assembly.export(out_step, exportType="STEP")
 print(f"saved: {out_glb}")
 print(f"saved: {out_step}")
-print(f"total: {len(names)} primary + {len(instances)} instances = {len(names)+len(instances)}")
+print(f"total: {len(names)} primary = {len(names)}")
