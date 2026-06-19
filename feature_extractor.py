@@ -15,6 +15,29 @@ TOL = 0.1; CYL_TOL = 0.5
 MIN_FACE_AREA = 50
 MIN_CYL_R_RATIO = 0.005  # 圆柱半径 < 对角线*0.5% 跳过
 
+# ==================== 半径分桶（倒排索引） ====================
+# 标准机械尺寸 + 0.5mm 公差带
+_STANDARD_RADII = sorted([
+    0.8, 1.0, 1.2, 1.6, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5,
+    5.0, 5.5, 6.0, 6.5, 7.0, 7.5, 8.0, 9.0, 10.0, 11.0,
+    12.0, 14.0, 16.0, 18.0, 20.0, 22.0, 24.0, 27.0, 30.0,
+    33.0, 36.0, 39.0, 42.0
+])
+_BUCKET_TOL = 0.5  # 标准尺寸容差
+
+
+def quantize_radius(r):
+    """将圆柱半径归入最近的机械标准尺寸桶，返回桶标签字符串"""
+    if r <= 0:
+        return f"R{round(r, 1):.1f}"
+    # 查找最近的标准尺寸
+    for std in _STANDARD_RADII:
+        if abs(r - std) <= _BUCKET_TOL:
+            return f"M{std:.1f}".replace(".0", "")
+    # 非标准尺寸：按 1mm 粒度分桶
+    bucket = round(r)
+    return f"R{bucket}"
+
 
 def _pt(face):
     es = face.Edges(); return es[0].startPoint() if es else face.Center()
@@ -57,7 +80,8 @@ def extract_planar(shape):
         cs, ls = [], []
         for e in f.Edges():
             if e.geomType() == "CIRCLE":
-                cs.append({"len": round(e.Length(), 6),
+                l = e.Length()
+                cs.append({"len": round(l, 6), "r": round(l / (2 * math.pi), 6),
                            "c": [e.Center().x, e.Center().y, e.Center().z]})
             elif e.geomType() == "LINE":
                 ls.append({"len": round(e.Length(), 6),
@@ -113,7 +137,8 @@ def extract_cylinders(shape):
                 "r": round(r, 4), "ext": ext,
                 "mid": [mid.x, mid.y, mid.z],
                 "dir": [d.x, d.y, d.z],
-                "ends": ends
+                "ends": ends,
+                "bucket": quantize_radius(r)
             })
         except Exception: pass
     # 排序圆柱：确保跨零件匹配顺序一致（螺栓孔对齐关键）
@@ -130,13 +155,17 @@ def summary(features):
     p = features["planar"]
     c = features["cylinders"]
     cyl_by_r = {}
+    cyl_by_bucket = {}
     for x in c:
         rk = round(x["r"], 1)
         cyl_by_r[rk] = cyl_by_r.get(rk, 0) + 1
+        bk = x.get("bucket", f"R{round(x['r'],1)}")
+        cyl_by_bucket[bk] = cyl_by_bucket.get(bk, 0) + 1
     return {
         "n_planar": len(p),
         "n_cylinders": len(c),
         "cyl_by_radius": {str(k): v for k, v in sorted(cyl_by_r.items())[:20]},
+        "cyl_buckets": {k: v for k, v in sorted(cyl_by_bucket.items())},
         "max_face_area": max((f["area"] for f in p), default=0)
     }
 

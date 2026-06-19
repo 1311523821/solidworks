@@ -26,7 +26,8 @@ def match_planar(fa, fb):
     res = []
     for a in fa:
         for b in fb:
-            mc = _match_list(a["circles"], b["circles"], "len", TOL)
+            # 圆用半径匹配（CYL_TOL=0.5mm），替代周长 0.1mm（半径仅0.016mm过严）
+            mc = _match_list(a["circles"], b["circles"], "r", CYL_TOL)
             ml = _match_list(a["lines"], b["lines"], "len", TOL)
             t = len(mc) + len(ml)
             if t >= MIN_OK or (t >= MIN_OK_LOOSE and len(mc) >= 1):
@@ -38,7 +39,7 @@ def match_slot(fa, fb):
     res = []
     for a in fa:
         for b in fb:
-            mc = _match_list(a["circles"], b["circles"], "len", TOL)
+            mc = _match_list(a["circles"], b["circles"], "r", CYL_TOL)
             ml = _match_list(a["lines"], b["lines"], "len", TOL)
             t = len(mc) + len(ml)
             if t >= SLOT_MIN:
@@ -46,26 +47,66 @@ def match_slot(fa, fb):
     return res
 
 
+def _bucket_key(cyl):
+    """获取圆柱的半径桶标签（兼容旧特征文件）"""
+    r = cyl["r"]
+    bucket = cyl.get("bucket")
+    if bucket is not None:
+        return bucket
+    # 旧文件兼容：现场分桶
+    from feature_extractor import quantize_radius
+    return quantize_radius(r)
+
+
+def _classify_match(m):
+    """基于配合紧密度分类匹配角色（非绝对半径）。
+    螺栓孔：bore > shaft 且间隙 >= 0.3mm（明显间隙配合）
+    止口/销：间隙极小(<0.1) 或 过盈的精密配合"""
+    if m.get("bore_to_bore"):
+        return "bolt-verify"
+    if m.get("interference"):
+        return "interference"
+    clearance = m.get("clearance", 0)
+    s_r = m["shaft"]["r"]
+    if clearance >= 0.3:  # 超过0.3mm间隙 → 螺栓孔
+        return "bolt"
+    if s_r > 15:  # 大半径 + 紧密配合 → 止口
+        return "spigot"
+    if clearance < 0.1 and s_r >= 2 and s_r <= 12:  # 紧密配合 + 中等半径 → 定位销
+        return "dowel"
+    return "shaft-bore"
+
+
 def match_cylinders(ca, cb, strict_axis=False, ref_a=None, ref_b=None):
-    """圆柱匹配：半径相等 + 可选轴过滤 + 可选空间偏移验证"""
+    """圆柱匹配：桶索引 O(k²) 替代笛卡尔积 O(n×m)"""
+    # 构建 cb 的桶索引
+    cb_index = {}
+    for b_idx, b in enumerate(cb):
+        bk = _bucket_key(b)
+        cb_index.setdefault(bk, []).append((b_idx, b))
+
     ms = []
-    used_b = set()  # 防止孔-孔匹配中同一目标被多次匹配
-    for a in ca:
-        for b_idx, b in enumerate(cb):
+    used_a = set()
+    used_b = set()
+
+    for a_idx, a in enumerate(ca):
+        bk = _bucket_key(a)
+        if bk not in cb_index:  # cb 中没有同桶的圆柱 → 跳过
+            continue
+        for b_idx, b in cb_index[bk]:
             same_type = a["ext"] == b["ext"]
-            if same_type and a["ext"]: continue  # 跳过轴-轴，只保留孔-孔（螺栓对齐）和轴-孔
+            if same_type and a["ext"]: continue  # 跳过轴-轴
             if abs(a["r"] - b["r"]) > CYL_TOL: continue
             if strict_axis:
                 dot = abs(a["dir"][0]*b["dir"][0] + a["dir"][1]*b["dir"][1] + a["dir"][2]*b["dir"][2])
                 if dot < 0.9: continue
-            # 空间偏移验证：仅当两面共享平面匹配（法向平行）时才做
             if ref_a and ref_b and strict_axis:
                 da = sum((a["mid"][k] - ref_a[k])**2 for k in range(3))**0.5
                 db = sum((b["mid"][k] - ref_b[k])**2 for k in range(3))**0.5
                 if abs(da - db) > 5: continue
-            if same_type:  # 孔-孔：螺栓对齐 — 空间验证防配对错乱
-                if b_idx in used_b: continue  # 每个目标只用一次
-                # 用最大内孔做参考，验证径向距离一致
+            if same_type:  # 孔-孔（bore-to-bore）
+                if b_idx in used_b: continue
+                if a_idx in used_a: continue
                 big_a = max((c for c in ca if not c["ext"]), key=lambda c: c["r"], default=None)
                 big_b = max((c for c in cb if not c["ext"]), key=lambda c: c["r"], default=None)
                 if big_a and big_b and big_a["r"] > a["r"] and big_b["r"] > b["r"]:
@@ -77,12 +118,24 @@ def match_cylinders(ca, cb, strict_axis=False, ref_a=None, ref_b=None):
                     ra = _radial(a, big_a); rb = _radial(b, big_b)
                     if abs(ra - rb) > 1.0:
                         continue
-                used_b.add(b_idx)
+                used_b.add(b_idx); used_a.add(a_idx)
                 ms.append({"shaft": a, "bore": b, "shaft_in_a": True, "bore_to_bore": True})
-                break  # 每个源只匹配第一个合格目标
+                break
             else:
-                ms.append({"shaft": a if a["ext"] else b,
-                           "bore": b if a["ext"] else a, "shaft_in_a": a["ext"]})
+                if b_idx in used_b: continue
+                if a_idx in used_a: continue
+                used_b.add(b_idx); used_a.add(a_idx)
+                shaft_cyl = a if a["ext"] else b
+                bore_cyl = b if a["ext"] else a
+                dr = shaft_cyl["r"] - bore_cyl["r"]
+                # 过盈配合：轴略大于孔(0~0.05mm) → 设计意图的物理干涉
+                # dr > 0.05mm → 不是过盈配合，是尺寸错误/严重干涉
+                interference = dr > 0 and dr <= 0.05
+                clearance = max(0, -dr)  # 间隙量
+                ms.append({"shaft": shaft_cyl, "bore": bore_cyl,
+                           "shaft_in_a": a["ext"], "interference": interference,
+                           "clearance": clearance})
+                break
     return ms
 
 
@@ -294,9 +347,12 @@ def _frame_in_frame(na, nb, parts, labels, idx_counter, face_info, used_p, fif_s
         cage_slots, fan_frames_init = slot_b, slot_a
         cage_name, fan_name = nb, na
 
-    # 加载FAN几何体计算质心（用于过滤前/后面歧义）
-    from cadquery import importers as cq_importers
+    # 加载FAN几何体（过大文件跳过，避免OOM/卡死）
+    import os as _os
     fan_shape_path = parts[fan_name]["shape_path"]
+    if _os.path.getsize(fan_shape_path) > 30 * 1024 * 1024:
+        return False  # >30MB 跳过 FIF
+    from cadquery import importers as cq_importers
     fan_shape = cq_importers.importStep(fan_shape_path).val()
     fan_bb = fan_shape.BoundingBox()
     fan_centroid = cq.Vector(
@@ -307,8 +363,10 @@ def _frame_in_frame(na, nb, parts, labels, idx_counter, face_info, used_p, fif_s
     # 过滤FAN框架面：只保留实体在法向反方向的面（法向朝外，实体在法向反方向=正确配合面）
     valid_fan_frames = []
     for ff in fan_frames_init:
-        body_dir = fan_centroid.z - ff["c"][2]  # face->centroid, into solid body
-        if body_dir * ff["n"][2] < 0:  # body on opposite side of outward normal
+        # 3D向量：面心→质心，面法向应指向体外
+        body_vec = fan_centroid - cq.Vector(ff["c"][0], ff["c"][1], ff["c"][2])
+        face_n = cq.Vector(ff["n"][0], ff["n"][1], ff["n"][2])
+        if body_vec.dot(face_n) < 0:  # 质心在法向反侧 = 实体在面内
             valid_fan_frames.append(ff)
     if valid_fan_frames:
         fan_frames_init = valid_fan_frames
@@ -385,7 +443,7 @@ def _frame_in_frame(na, nb, parts, labels, idx_counter, face_info, used_p, fif_s
                                           fan_frame["c"], f["c"], len_tol=999.0)
             if len(ml) < 1:
                 continue
-            mc = _match_list(fan_frame.get("circles", []), f.get("circles", []), "len", 1.0)
+            mc = _match_list(fan_frame.get("circles", []), f.get("circles", []), "r", CYL_TOL)
             if not _check_fit(fan_frame, f):
                 continue
             len_penalty = sum(abs(al["len"] - bl["len"]) for al, bl in ml)
@@ -404,10 +462,10 @@ def _frame_in_frame(na, nb, parts, labels, idx_counter, face_info, used_p, fif_s
         x_key = round(cage_cand["c"][0] / 10) * 10
         y_key = round(cage_cand["c"][1] / 10) * 10
         xy = (x_key, y_key)
-        # 深度方向依赖FAN面法向：前面(nZ=+1)配天花板→选Z更大(更靠近CAGE顶)
-        # 背面(nZ=-1)配地板→选Z更小(更深入槽底)
-        depth_z = -cage_cand["c"][2] * fn.z
-        body_off = abs(fan_centroid.z - ff["c"][2])  # 面心到质心距离=体不对称度
+        # 深度方向依赖当前FAN面法向（用 ff 而非外循环残留的 fn）
+        n_fan_z = ff["n"][2]
+        depth_z = -cage_cand["c"][2] * n_fan_z
+        body_off = abs(fan_centroid.z - ff["c"][2])
         if xy not in xy_best:
             xy_best[xy] = (score, ff, cage_cand, ml, mc, body_off, depth_z)
         else:
@@ -450,19 +508,41 @@ def _frame_in_frame(na, nb, parts, labels, idx_counter, face_info, used_p, fif_s
         idx = idx_counter[0]
         idx_counter[0] += 1
         la, lb = planar_labels(m, na_real, nb_real, idx)
-        # FAN xDir 用 CAGE 槽 xDir 投影（框架边框对齐）
-        cage_x = [lb["geometry"]["x"]["x"], lb["geometry"]["x"]["y"], lb["geometry"]["x"]["z"]]
-        fan_z = [la["geometry"]["z"]["x"], la["geometry"]["z"]["y"], la["geometry"]["z"]["z"]]
-        fan_x_aligned = _ortho(fan_z, cage_x)
-        la["geometry"]["x"] = fan_x_aligned["x"]
-        la["geometry"]["y"] = fan_x_aligned["y"]
+        # 自适应 Z 插深修正：读取 CAGE 槽位内螺栓孔端面 Z，补偿 FAN 原点
+        # 找到该槽位(xy)附近的 CAGE 内孔面，其 Z 坐标即真正的定位台阶深度
+        slot_x, slot_y = cage_cand["c"][0], cage_cand["c"][1]
+        # Z 插深修正：找槽位内 Z 向平行且更深的面（螺栓孔肩面等）
+        inner_z = cage_cand["c"][2]
+        all_cage_faces = fb_list if cage_name == nb else fa_list
+        for cf in all_cage_faces:
+            if abs(cf["c"][0] - slot_x) < 30 and abs(cf["c"][1] - slot_y) < 30:
+                # 法向平行（同向或反向）且沿法向更深
+                nz_prod = cf["n"][2] * cage_cand["n"][2]
+                if abs(nz_prod) < 0.5:
+                    continue  # 法向不平行
+                dz = cf["c"][2] - cage_cand["c"][2]
+                if 2.0 < abs(dz) < 80.0:  # 深度差 2~80mm（覆盖厚风扇36.6mm）
+                    if (cage_cand["n"][2] > 0 and cf["c"][2] > inner_z) or \
+                       (cage_cand["n"][2] < 0 and cf["c"][2] < inner_z):
+                        inner_z = cf["c"][2]
+                    if (cage_cand["n"][2] > 0 and cf["c"][2] > inner_z) or \
+                       (cage_cand["n"][2] < 0 and cf["c"][2] < inner_z):
+                        inner_z = cf["c"][2]
+        if abs(inner_z - cage_cand["c"][2]) > 1.0:
+            lb["geometry"]["origin"]["z"] += (inner_z - cage_cand["c"][2])
 
-        # Z修正：使FAN前端对齐CAGE槽口最高面(外法兰)
-        cage_top_z = max((f["c"][2] for f in cage_slots
-                          if abs(f["c"][0]-cage_cand["c"][0])<5
-                          and abs(f["c"][1]-cage_cand["c"][1])<5), default=cage_cand["c"][2])
-        fan_world_top = cage_cand["c"][2] + (fan_bb.zmax - ff["c"][2])
-        la["geometry"]["origin"]["z"] += (fan_world_top - cage_top_z)
+        # 修正 FAN Z 面选择：当前 ff 可能是后端面，用螺栓孔 Z 找前端安装面
+        all_fan_faces = fa_list if fan_name == na else fb_list
+        bolt_zs = []
+        for bf in all_fan_faces:
+            if abs(bf["c"][0] - ff["c"][0]) < 30 and abs(bf["c"][1] - ff["c"][1]) < 30:
+                if abs(bf["n"][2]) > 0.7 and len(bf.get("circles", [])) >= 2:
+                    bolt_zs.append(bf["c"][2])
+        if bolt_zs:
+            # 取 Z 最大（最靠近 CAGE 格栅侧）= 前端面
+            front_z = max(bolt_zs)
+            if abs(front_z - ff["c"][2]) > 2.0:
+                la["geometry"]["origin"]["z"] += (front_z - ff["c"][2])
 
         labels[na_real].append(la)
         labels[nb_real].append(lb)
@@ -505,6 +585,64 @@ def _xform_point(loc, vec):
 def _xform_dir(loc, vec):
     """用 Location 变换方向向量"""
     return _xform_point(loc, vec) - _xform_point(loc, cq.Vector(0, 0, 0))
+
+
+def _check_collision(shape_a, shape_b, T_AB,
+                      min_volume=100.0, min_ratio=0.001):
+    """检测两零件装配后是否有体积交叠（布尔求交）。
+
+    shape_a, shape_b: cadquery Shape 对象（各自局部 CS）
+    T_AB: A→B 的刚体变换（cq.Location）
+    返回: (has_collision, overlap_ratio, info_dict)
+    碰撞判定：交集体积 > 100mm³ 且 比率 > 0.1%
+    """
+    # 变换 A 到 B 的空间
+    shape_a_moved = shape_a.located(T_AB)
+
+    # AABB 快速过滤
+    bb_a = shape_a_moved.BoundingBox()
+    bb_b = shape_b.BoundingBox()
+    vol_a = (bb_a.xmax - bb_a.xmin) * (bb_a.ymax - bb_a.ymin) * (bb_a.zmax - bb_a.zmin)
+    if vol_a <= 0:
+        return False, 0.0, {"aabb_ratio": 0.0, "bool_ratio": 0.0}
+
+    dx = max(0, min(bb_a.xmax, bb_b.xmax) - max(bb_a.xmin, bb_b.xmin))
+    dy = max(0, min(bb_a.ymax, bb_b.ymax) - max(bb_a.ymin, bb_b.ymin))
+    dz = max(0, min(bb_a.zmax, bb_b.zmax) - max(bb_a.zmin, bb_b.zmin))
+    aabb_ratio = (dx * dy * dz) / vol_a
+
+    if aabb_ratio < 0.001:
+        return False, 0.0, {"aabb_ratio": aabb_ratio, "bool_ratio": 0.0}
+
+    # 精确布尔求交
+    bool_vol = -1.0
+    try:
+        result = shape_a_moved.intersect(shape_b)
+        if result.isValid():
+            bool_vol = result.Volume()
+    except Exception:
+        bool_vol = -1.0
+
+    if bool_vol < 0:
+        # 布尔求交失败 → 降级 AABB：< 10% 为面接触/正确嵌套，不算碰撞
+        has_collision = aabb_ratio > 0.10
+        return has_collision, -1.0, {"aabb_ratio": aabb_ratio, "bool_ratio": -1.0, "bool_vol": -1.0}
+
+    bool_ratio = bool_vol / vol_a if vol_a > 0 else 0.0
+    has_collision = bool_vol > min_volume
+    return has_collision, bool_ratio, {"aabb_ratio": aabb_ratio, "bool_ratio": bool_ratio, "bool_vol": bool_vol}
+
+
+def _label_transform(la, lb):
+    """从一对标签计算 T_AB：零件A→零件B 的刚体变换。
+    公式：world[B] = world[A] * loc_A * loc_B⁻¹，即 T_AB = loc_A * loc_B⁻¹
+    """
+    def _geo_to_loc(geo):
+        o = cq.Vector(geo["origin"]["x"], geo["origin"]["y"], geo["origin"]["z"])
+        x = cq.Vector(geo["x"]["x"], geo["x"]["y"], geo["x"]["z"])
+        z = cq.Vector(geo["z"]["x"], geo["z"]["y"], geo["z"]["z"])
+        return cq.Location(cq.Plane(origin=o, xDir=x, normal=z))
+    return _geo_to_loc(la["geometry"]) * _geo_to_loc(lb["geometry"]).inverse
 
 
 def _loc_from_origin_and_z(origin, z_dir, x_hint=None):
@@ -649,12 +787,24 @@ def match_all(parts, world_step=None):
     ky_name = next((n for n in names if "key" in n.lower()), None)
     sh_name = next((n for n in names if "shaft" in n.lower()), None)
 
+    # 懒加载 STEP 形状（仅在需要碰撞检测时加载）
+    shapes = {}
+    def _get_shape(nm):
+        if nm not in shapes and "shape_path" in parts[nm]:
+            from cadquery import importers as _imp
+            shapes[nm] = _imp.importStep(parts[nm]["shape_path"]).val()
+        return shapes.get(nm)
+
     # === Step 0: 检测多圆柱零件对 → 框架嵌入匹配 ===
     multi_cyl_pairs = []
     for i in range(len(names)):
         for j in range(i + 1, len(names)):
             ca = parts[names[i]]["features"]["cylinders"]
             cb = parts[names[j]]["features"]["cylinders"]
+            # 跳过两面都超多的对（仅一面多时可以匹配）
+            pa = len(parts[names[i]]["features"]["planar"])
+            pb = len(parts[names[j]]["features"]["planar"])
+            if pa > 500 and pb > 500: continue
             if len(ca) > MULTI_CYL_THRESHOLD and len(cb) > MULTI_CYL_THRESHOLD:
                 multi_cyl_pairs.append((names[i], names[j]))
 
@@ -677,10 +827,21 @@ def match_all(parts, world_step=None):
         for j in range(i + 1, len(names)):
             na, nb = names[i], names[j]
             if (na, nb) in processed_fif:
-                continue  # 已通过框架嵌入处理
+                continue
             if ky_name and (ky_name in (na, nb) and any("flange" in x for x in (na, nb))):
                 continue
-            ms = match_planar(parts[na]["features"]["planar"], parts[nb]["features"]["planar"])
+            # 跳过两面都超多的对，一面多时只取最大的 100 个面
+            pa = len(parts[na]["features"]["planar"])
+            pb = len(parts[nb]["features"]["planar"])
+            if pa > 200 and pb > 200:
+                continue
+            fa_list = parts[na]["features"]["planar"]
+            fb_list = parts[nb]["features"]["planar"]
+            if pa > 100:
+                fa_list = sorted(fa_list, key=lambda f: f.get("area", 0), reverse=True)[:100]
+            if pb > 100:
+                fb_list = sorted(fb_list, key=lambda f: f.get("area", 0), reverse=True)[:100]
+            ms = match_planar(fa_list, fb_list)
             if ms:
                 ms.sort(key=lambda m: m["t"], reverse=True)
                 planar_pairs.append((na, nb, ms))
@@ -692,21 +853,24 @@ def match_all(parts, world_step=None):
         for m in ms:
             ka, kb = _fk(m["fa"]), _fk(m["fb"])
             if ka in used_p.get(na, set()) or kb in used_p.get(nb, set()): continue
-            # outward check
-            from cadquery import importers
-            shape_a = importers.importStep(parts[na]["shape_path"]).val()
-            shape_b = importers.importStep(parts[nb]["shape_path"]).val()
-            bb_a = shape_a.BoundingBox(); bb_b = shape_b.BoundingBox()
-            bc_a = cq.Vector((bb_a.xmin+bb_a.xmax)/2, (bb_a.ymin+bb_a.ymax)/2, (bb_a.zmin+bb_a.zmax)/2)
-            bc_b = cq.Vector((bb_b.xmin+bb_b.xmax)/2, (bb_b.ymin+bb_b.ymax)/2, (bb_b.zmin+bb_b.zmax)/2)
-            fc_a = cq.Vector(m["fa"]["c"][0], m["fa"]["c"][1], m["fa"]["c"][2])
-            fc_b = cq.Vector(m["fb"]["c"][0], m["fb"]["c"][1], m["fb"]["c"][2])
+            # outward check（仅当形状已缓存时才做，避免大文件加载卡死）
+            s_a = shapes.get(na); s_b = shapes.get(nb)
             n_a = cq.Vector(m["fa"]["n"][0], m["fa"]["n"][1], m["fa"]["n"][2])
             n_b = cq.Vector(m["fb"]["n"][0], m["fb"]["n"][1], m["fb"]["n"][2])
-            if fc_a.sub(bc_a).dot(n_a) < 0 or fc_b.sub(bc_b).dot(n_b) < 0: continue
+            if s_a is not None and s_b is not None:
+                bb_a = s_a.BoundingBox(); bb_b = s_b.BoundingBox()
+                bc_a = cq.Vector((bb_a.xmin+bb_a.xmax)/2, (bb_a.ymin+bb_a.ymax)/2, (bb_a.zmin+bb_a.zmax)/2)
+                bc_b = cq.Vector((bb_b.xmin+bb_b.xmax)/2, (bb_b.ymin+bb_b.ymax)/2, (bb_b.zmin+bb_b.zmax)/2)
+                fc_a = cq.Vector(m["fa"]["c"][0], m["fa"]["c"][1], m["fa"]["c"][2])
+                fc_b = cq.Vector(m["fb"]["c"][0], m["fb"]["c"][1], m["fb"]["c"][2])
+                if fc_a.sub(bc_a).dot(n_a) < 0 or fc_b.sub(bc_b).dot(n_b) < 0: continue
+            # 面法向检查：t≥3的高质量匹配跳过（管法兰、弯头等非直对场景）
+            if m["t"] < MIN_OK and n_a.dot(n_b) > -0.5:
+                continue
             ca = len(parts[na]["features"]["cylinders"])
             cb = len(parts[nb]["features"]["cylinders"])
-            if ca > 50 and cb > 50 and abs(n_a[2]) > 0.7 and abs(n_b[2]) > 0.7 and n_a[2]*n_b[2] < 0: continue
+            # 已由 FIF 处理的多圆柱对：跳过重复 PLANAR（用 3D 法向替代 Z 轴）
+            if ca > 50 and cb > 50 and n_a.dot(n_b) < -0.7: continue
             valid.append(m)
         if not valid: continue
 
@@ -838,7 +1002,9 @@ def match_all(parts, world_step=None):
             strict = len(ca) > 50 and len(cb) > 50
             ref_a = face_info[na]["c"] if na in face_info else None
             ref_b = face_info[nb]["c"] if nb in face_info else None
-            # FIF对不用空间偏移验证（面中心z差36mm），列过滤替代
+            # 两面来自不同配合时（如都>200面），空间偏移验证无意义
+            if (na, nb) not in pairs_with_labels:
+                ref_a = ref_b = None
             ms = match_cylinders(ca, cb, strict_axis=strict,
                                  ref_a=(None if is_fif else ref_a),
                                  ref_b=(None if is_fif else ref_b))
@@ -869,7 +1035,12 @@ def match_all(parts, world_step=None):
 
     # 按半径降序排列：大框架/主轴优先
     for pair in cyl_pairs:
-        pair[2].sort(key=lambda m: m["shaft"]["r"], reverse=True)
+        # 按角色优先级排序：过盈 > 止口 > 销 > 普通 > 螺栓
+        role_order = {"interference": 0, "spigot": 1, "dowel": 2, "shaft-bore": 3, "bolt": 4, "bolt-verify": 5}
+        pair[2].sort(key=lambda m: (
+            role_order.get(_classify_match(m), 3),
+            -m["shaft"]["r"]  # 同角色按半径降序
+        ))
 
     used_c = {}
     used_sf = set()
@@ -886,6 +1057,7 @@ def match_all(parts, world_step=None):
             discarded_cylinder_matches[(na, nb)] = (
                 all_valid[0], all_valid[1:])
 
+        # 已有 PLANAR/框架标签的零件对不再追加 CYLINDER 标签
         # 已有 PLANAR/框架标签的零件对不再追加 CYLINDER 标签
         if (na, nb) in pairs_with_labels:
             continue
@@ -925,50 +1097,117 @@ def match_all(parts, world_step=None):
                     b_x = _vec_sub(slot_faces[b_has], b_cyl["mid"])
             idx[0] += 1
             slot_note = " [SLOT-x]" if (s_x or b_x) else ""
-            print(f"  [{idx[0]}] {na}<->{nb}: R={m['shaft']['r']:.2f}{slot_note}")
+            role = _classify_match(m)
+            role_note = f" [{role}]" if role not in ("shaft-bore", "bolt-verify") else ""
+            print(f"  [{idx[0]}] {na}<->{nb}: R={m['shaft']['r']:.2f}{slot_note}{role_note}")
             la, lb = cylinder_labels(m, na, nb, idx[0], bore_pt, s_x, b_x, shaft_pt)
             labels[na].append(la); labels[nb].append(lb)
 
     # === Step 4: 用被丢弃的标签验证选中标签的正确性 ===
     verify_results = _run_verification(discarded_planar_matches, discarded_cylinder_matches)
 
-    # === Step 4b: 验证失败 → 从丢弃的候选中寻找替代 ===
+    # === Step 4b: 碰撞检测（PRIMARY 标签）===
+    collided_pairs = set()
+    for (na, nb) in pairs_with_labels:
+        # 找出这对零件的 PRIMARY 标签 mating ID
+        gid_to_labels = {}
+        for nm in (na, nb):
+            for l in labels[nm]:
+                gid = l["identifier"].rsplit("_Mating_", 1)[1] if "_Mating_" in l["identifier"] else ""
+                gid_to_labels.setdefault(gid, []).append((nm, l))
+        for gid, items in gid_to_labels.items():
+            if len(items) != 2: continue
+            (n1, l1), (n2, l2) = items
+            # 过盈配合：跳过碰撞检测（物理干涉是设计意图）
+            if l1.get("userData", {}).get("interference") or l2.get("userData", {}).get("interference"):
+                print(f"  [INTERFERENCE] {na}<->{nb}: intentional fit, skip collision")
+                continue
+            s1, s2 = _get_shape(n1), _get_shape(n2)
+            if s1 is None or s2 is None: continue
+            # 跳过超大文件的碰撞检测（加载太慢）
+            import os as _os2
+            sp1 = parts.get(n1, {}).get("shape_path","")
+            sp2 = parts.get(n2, {}).get("shape_path","")
+            if (_os2.path.getsize(sp1) if sp1 else 0) > 30*1024*1024: continue
+            if (_os2.path.getsize(sp2) if sp2 else 0) > 30*1024*1024: continue
+            # T_n1→n2 = loc(l2) * loc(l1)⁻¹（装配公式的逆）
+            T_AB = _label_transform(l2, l1)
+            has_coll, ratio, info = _check_collision(s1, s2, T_AB)
+            if has_coll:
+                print(f"  [COLLISION] {na}<->{nb}: vol={info.get('bool_vol',0):.0f}mm3"
+                      f" ratio={info['bool_ratio']:.4f}")
+                collided_pairs.add((na, nb))
+            elif info['aabb_ratio'] > 0.001:
+                tag = " [NESTED]" if info['aabb_ratio'] > 0.80 else ""
+                print(f"  [FIT] {na}<->{nb}: aabb={info['aabb_ratio']:.3f}"
+                      f" bool={info.get('bool_vol',0):.0f}mm3{tag}")
+
+    # === Step 4c: 验证失败或碰撞 → 从丢弃的候选中寻找替代 ===
+    # 收集所有需要回退的零件对
+    fallback_pairs = set()
     for (na, nb), vdata in verify_results.items():
         cyl = vdata.get("CYL")
         if cyl is None: continue
         _, _, cyl_rate = cyl
-        if cyl_rate >= 0.50: continue  # 验证通过
+        if cyl_rate < 0.50 or (na, nb) in collided_pairs:
+            fallback_pairs.add((na, nb))
+    # 也要处理 verify_results 未覆盖的碰撞对
+    fallback_pairs.update(collided_pairs)
+
+    for (na, nb) in fallback_pairs:
+        # 不替换 FIF 标签（框架嵌入的物理位置是正确的）
+        if (na, nb) in processed_fif or (nb, na) in processed_fif:
+            continue
 
         cyl_info = discarded_cylinder_matches.get((na, nb))
         if cyl_info is None: continue
         best_cyl_ref, other_cyls = cyl_info
 
-        # 候选序列：其他 PLANAR → 其他 CYL（除 boreToBore）
+        # 候选序列：其他 PLANAR → 其他 CYL（限20个，防止碰撞检测卡死）
         candidates = []
         planar_info = discarded_planar_matches.get((na, nb))
         if planar_info:
             _, discarded_pl = planar_info
-            # 按 t 降序排列
-            discarded_pl_sorted = sorted(discarded_pl, key=lambda m: m["t"], reverse=True)
+            discarded_pl_sorted = sorted(discarded_pl, key=lambda m: m["t"], reverse=True)[:10]
             for m in discarded_pl_sorted:
                 candidates.append(("PLANAR", m))
-        for m in other_cyls:
-            if not m.get("bore_to_bore", False):
-                candidates.append(("CYL", m))
+        cyl_candidates = [m for m in other_cyls if not m.get("bore_to_bore", False)]
         if best_cyl_ref and not best_cyl_ref.get("bore_to_bore", False):
-            candidates.append(("CYL", best_cyl_ref))
+            cyl_candidates.append(best_cyl_ref)
+        for m in cyl_candidates[:10]:
+            candidates.append(("CYL", m))
 
         found = False
         for cand_type, cand_match in candidates:
-            # 用该候选的变换验证 CYL 一致性
+            # 计算该候选的变换（compute 给出 nb→na，碰撞需要 na→nb）
+            if cand_type == "PLANAR":
+                T_cand = _compute_planar_transform(cand_match).inverse
+            else:
+                T_cand = _compute_cylinder_transform(cand_match).inverse
+
+            # 过盈配合：跳过碰撞检测（设计意图的物理干涉）
+            if not cand_match.get("interference"):
+                s_a_fb, s_b_fb = _get_shape(na), _get_shape(nb)
+            else:
+                s_a_fb = s_b_fb = None
+            if s_a_fb is not None and s_b_fb is not None:
+                shape_moved = s_a_fb.located(T_cand)
+                bb_a = shape_moved.BoundingBox(); bb_b = s_b_fb.BoundingBox()
+                dx = max(0, min(bb_a.xmax, bb_b.xmax) - max(bb_a.xmin, bb_b.xmin))
+                dy = max(0, min(bb_a.ymax, bb_b.ymax) - max(bb_a.ymin, bb_b.ymin))
+                dz = max(0, min(bb_a.zmax, bb_b.zmax) - max(bb_a.zmin, bb_b.zmin))
+                aabb_overlap = (dx * dy * dz) / max(1, (bb_a.xmax-bb_a.xmin)*(bb_a.ymax-bb_a.ymin)*(bb_a.zmax-bb_a.zmin))
+                if aabb_overlap > 0.50:  # 大面积AABB交叠 → 跳过
+                    print(f"    skip: AABB overlap={aabb_overlap:.2f}")
+                    continue
+
+            # CYL 轴线一致性验证
             if cand_type == "PLANAR":
                 verify_ref = [best_cyl_ref] if best_cyl_ref else []
                 verify_ref += [m for m in other_cyls if not m.get("bore_to_bore", False)]
                 if not verify_ref:
-                    verify_ref = [m for m in other_cyls]  # fallback to boreToBore
-                # 检查该 PLANAR 候选与所有 CYL 的轴线一致性
+                    verify_ref = [m for m in other_cyls]
                 all_ok = True
-                T_cand = _compute_planar_transform(cand_match)
                 for cyl_m in verify_ref:
                     T_cyl = _compute_cylinder_transform(cyl_m)
                     s = cyl_m["shaft"]
@@ -982,13 +1221,10 @@ def match_all(parts, world_step=None):
                         if angle > 15.0:
                             all_ok = False
                             break
-                if all_ok:
-                    found = True
-                    break
-            else:  # CYL candidate
-                # CYL 候选：检查与其他 CYL 的一致性
+                if not all_ok:
+                    continue
+            else:
                 if best_cyl_ref and cand_match is not best_cyl_ref:
-                    T_cand = _compute_cylinder_transform(cand_match)
                     T_ref = _compute_cylinder_transform(best_cyl_ref)
                     s = cand_match["shaft"]
                     d_a = _vec(s["dir"])
@@ -998,16 +1234,49 @@ def match_all(parts, world_step=None):
                         dot_v = max(-1.0, min(1.0,
                             d_cand.normalized().dot(d_ref.normalized())))
                         angle = math.degrees(math.acos(abs(dot_v)))
-                        if angle < 15.0:
-                            found = True
-                            break
-                else:
-                    found = True
-                    break
+                        if angle > 15.0:
+                            continue
+
+            found = True
+            break
 
         if not found: continue
 
-        # 找到替代 → 移除旧 PLANAR，生成新标签
+        # 找到候选 → 生成标签 → 最终碰撞验证 → 确认无碰撞才替换
+        idx[0] += 1
+        if cand_type == "PLANAR":
+            la, lb = planar_labels(cand_match, na, nb, idx[0])
+        else:
+            s_cyl = cand_match["shaft"]; b_cyl = cand_match["bore"]
+            s_has = na if cand_match["shaft_in_a"] else nb
+            b_has = nb if cand_match["shaft_in_a"] else na
+            bore_pt = (_bore_face_intersection(b_cyl, face_info[b_has])
+                       if b_has in face_info else None)
+            shaft_pt = (_bore_face_intersection(s_cyl, face_info[s_has])
+                        if s_has in face_info else None)
+            la, lb = cylinder_labels(cand_match, na, nb, idx[0], bore_pt, None, None, shaft_pt)
+
+        # 快速 AABB 最终验证（过盈配合跳过）
+        if not la.get("userData", {}).get("interference"):
+            T_real = _label_transform(lb, la)
+            s_a_r, s_b_r = _get_shape(na), _get_shape(nb)
+        else:
+            s_a_r = s_b_r = None
+        if s_a_r is not None and s_b_r is not None:
+            shape_moved = s_a_r.located(T_real)
+            bb_a = shape_moved.BoundingBox(); bb_b = s_b_r.BoundingBox()
+            dx = max(0, min(bb_a.xmax, bb_b.xmax) - max(bb_a.xmin, bb_b.xmin))
+            dy = max(0, min(bb_a.ymax, bb_b.ymax) - max(bb_a.ymin, bb_b.ymin))
+            dz = max(0, min(bb_a.zmax, bb_b.zmax) - max(bb_a.zmin, bb_b.zmin))
+            aabb_overlap = (dx * dy * dz) / max(1, (bb_a.xmax-bb_a.xmin)*(bb_a.ymax-bb_a.ymin)*(bb_a.zmax-bb_a.zmin))
+            if aabb_overlap > 0.80:  # >80% = 严重交叠 → 跳过
+                print(f"    [COLLISION] AABB={aabb_overlap:.2f} — try next")
+                continue
+
+        # 确认无碰撞 → 移除旧标签，追加新标签
+        print(f"  [FALLBACK] {na}<->{nb}: {cand_type}"
+              + (f" (R={s_cyl['r']:.2f})" if cand_type == "CYL" else f" (t={cand_match['t']})")
+              + " [OK]")
         planar_ids = set()
         for nm in (na, nb):
             for l in labels[nm]:
@@ -1018,25 +1287,8 @@ def match_all(parts, world_step=None):
             for nm in (na, nb):
                 labels[nm] = [l for l in labels[nm]
                               if not l["identifier"].endswith(f"_Mating_{gid}")]
-            break
-
-        idx[0] += 1
-        if cand_type == "PLANAR":
-            print(f"  [FALLBACK] {na}<->{nb}: try next PLANAR (t={cand_match['t']}, "
-                  f"CYL verify={cyl_rate:.0%})")
-            la, lb = planar_labels(cand_match, na, nb, idx[0])
-        else:
-            s_cyl = cand_match["shaft"]; b_cyl = cand_match["bore"]
-            s_has = na if cand_match["shaft_in_a"] else nb
-            b_has = nb if cand_match["shaft_in_a"] else na
-            bore_pt = (_bore_face_intersection(b_cyl, face_info[b_has])
-                       if b_has in face_info else None)
-            shaft_pt = (_bore_face_intersection(s_cyl, face_info[s_has])
-                        if s_has in face_info else None)
-            print(f"  [FALLBACK] {na}<->{nb}: PLANAR→CYL (R={s_cyl['r']:.2f}, "
-                  f"CYL verify={cyl_rate:.0%})")
-            la, lb = cylinder_labels(cand_match, na, nb, idx[0], bore_pt, None, None, shaft_pt)
         labels[na].append(la); labels[nb].append(lb)
+        # 继续处理 fallback_pairs 中其他碰撞对（不 break）
 
     return labels
 

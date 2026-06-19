@@ -90,6 +90,13 @@ def cylinder_labels(m, na, nb, idx, bore_origin=None, shaft_x=None, bore_x=None,
     meta = {"matchType": "CYLINDER", "radius": s["r"]}
     if bore_to_bore:
         meta["boreToBore"] = True
+    if m.get("interference"):
+        meta["interference"] = True
+    if m.get("clearance", 0) > 0.001:
+        meta["clearance"] = round(m["clearance"], 4)
+    # 旋转件定向标记：有键槽/槽口约束时不盲旋90°试探
+    if shaft_x is not None or bore_x is not None:
+        meta["directionFixed"] = True
     o_shaft = shaft_origin if shaft_origin else s["mid"]
     o_bore = bore_origin if bore_origin else b["mid"]
     shaft_nm = na if m["shaft_in_a"] else nb
