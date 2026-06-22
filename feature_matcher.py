@@ -52,6 +52,120 @@ def _is_axial(normal, parts, name):
     return abs(n.dot(pa)) > ZETA_AXIAL_ALIGN
 
 
+def _topological_signature(face, topo, relaxed=False):
+    """
+    计算面的一阶邻域拓扑签名（旋转/平移不变）。
+
+    格式: (surface_type, n_internal_loops, frozenset(neighbor_stats))
+    其中 neighbor_stats 聚合了邻域面的类型、[凸凹性]、边几何的计数。
+
+    relaxed=True: 忽略凸凹性（用于跨零件匹配，配合面凸凹性相反）。
+    relaxed=False: 保留凸凹性（用于同零件内剪枝）。
+
+    示例: ('plane', 8, frozenset({('cylinder','concave','circle',8), ('cylinder','convex','circle',1)}))
+    含义: 平面，8个螺栓孔（凹圆邻接），1个外轴（凸圆邻接）
+
+    参数:
+        face: face_data dict（含 surface_type, n_internal_loops, neighbors）
+        topo: topology_graph dict
+        relaxed: 跨零件匹配时忽略凸凹性（配合面凸凹性相反）
+    返回: (surface_type, n_loops, frozen_neighbor_stats) — 可哈希的签名元组
+    """
+    from collections import Counter
+    neighbors = face.get("neighbors", [])
+    stats = []
+    for nb in neighbors:
+        idx = nb["idx"]
+        if idx < len(topo["nodes"]):
+            nb_type = topo["nodes"][idx]["type"]
+        else:
+            nb_type = "unknown"
+        if relaxed:
+            stats.append((nb_type, nb.get("edge_geom", "unknown")))
+        else:
+            stats.append((
+                nb_type,
+                nb.get("convexity", "unknown"),
+                nb.get("edge_geom", "unknown"),
+            ))
+    aggregated = Counter(stats)
+    return (
+        face.get("surface_type", "unknown"),
+        face.get("n_internal_loops", 0),
+        frozenset(aggregated.items()),
+    )
+
+
+def _bfs_verify_pair(fa_idx, fb_idx, topo_a, topo_b, faces_a, faces_b, max_depth=2):
+    """
+    从核心面对 (fa_idx, fb_idx) 出发 BFS 扩散，验证邻域拓扑一致性。
+
+    对 fa 的每个邻居（一层邻域），在 fb 中寻找拓扑对应的邻居：
+      - 面类型相同
+      - 邻接边几何类型相同
+      - 最多扩散 max_depth 层
+
+    返回: (consistent: bool, details: dict{matched_pairs, depth_reached, unmatched})
+    """
+    nodes_a = topo_a.get("nodes", [])
+    nodes_b = topo_b.get("nodes", [])
+    if not nodes_a or not nodes_b:
+        return True, {"depth_reached": 0, "note": "no topology data"}
+
+    # 获取面的邻居索引
+    def _neighbor_indices(face, topo):
+        return [(nb["idx"], nb.get("edge_geom", "unknown")) for nb in face.get("neighbors", [])]
+
+    # BFS 队列：(fa_node_idx, fb_node_idx, depth)
+    queue = [(fa_idx, fb_idx, 0)]
+    # 已验证的匹配对
+    matched = {(fa_idx, fb_idx)}
+    fa_to_fb = {fa_idx: fb_idx}  # 已确认的面对应关系
+    visited_a = {fa_idx}
+    visited_b = {fb_idx}
+
+    while queue:
+        ca, cb, depth = queue.pop(0)
+        if depth >= max_depth:
+            continue
+
+        nb_a = _neighbor_indices(faces_a[ca], topo_a)
+        nb_b = _neighbor_indices(faces_b[cb], topo_b)
+
+        for na_idx, edge_geom_a in nb_a:
+            if na_idx in visited_a or na_idx >= len(nodes_a):
+                continue
+            na_type = nodes_a[na_idx]["type"]
+
+            # 在 B 中寻找拓扑对应的邻居
+            best_nb = None
+            for nb_idx, edge_geom_b in nb_b:
+                if nb_idx in visited_b or nb_idx >= len(nodes_b):
+                    continue
+                nb_type = nodes_b[nb_idx]["type"]
+                if na_type == nb_type and edge_geom_a == edge_geom_b:
+                    best_nb = nb_idx
+                    break
+
+            if best_nb is not None:
+                visited_a.add(na_idx)
+                visited_b.add(best_nb)
+                fa_to_fb[na_idx] = best_nb
+                matched.add((na_idx, best_nb))
+                queue.append((na_idx, best_nb, depth + 1))
+
+    detail = {
+        "depth_reached": max_depth,
+        "matched_pairs": len(matched),
+        "fa_visited": len(visited_a),
+        "fb_visited": len(visited_b),
+    }
+    # 如果至少验证了一组邻居对应关系，认为拓扑一致
+    # （单层：fa_idx 本身 + 至少 1 个邻居对应）
+    consistent = len(matched) >= 2
+    return consistent, detail
+
+
 def _match_list(la, lb, key, tol):
     m, u = [], [False] * len(lb)
     for a in la:
@@ -897,7 +1011,35 @@ def match_all(parts, world_step=None):
             Lp = _pair_L(parts, na, nb)
             cyl_tol_p = GAMMA_CYL_MATCH * Lp
             line_tol_p = GAMMA_LINE_MATCH * Lp
-            ms = match_planar(fa_list, fb_list, cyl_tol_p, line_tol_p)
+
+            # 拓扑签名索引匹配：O(K) 签名碰撞 替代 O(N_a×N_b) 笛卡尔积
+            topo_a = parts[na]["features"].get("topology_graph")
+            topo_b = parts[nb]["features"].get("topology_graph")
+            if topo_a and topo_b and len(topo_a.get("nodes",[])) > 0 and len(topo_b.get("nodes",[])) > 0:
+                sig_a = {}; sig_b = {}
+                for fi, f in enumerate(fa_list):
+                    sig = _topological_signature(f, topo_a, relaxed=True)
+                    sig_a.setdefault(sig, []).append(fi)
+                for fi, f in enumerate(fb_list):
+                    sig = _topological_signature(f, topo_b, relaxed=True)
+                    sig_b.setdefault(sig, []).append(fi)
+                ms = []
+                for sig, idx_a_list in sig_a.items():
+                    if sig not in sig_b:
+                        continue
+                    for ia in idx_a_list:
+                        a = fa_list[ia]
+                        for ib in sig_b[sig]:
+                            b = fb_list[ib]
+                            mc = _match_list(a["circles"], b["circles"], "r", cyl_tol_p)
+                            ml = _match_list(a["lines"], b["lines"], "len", line_tol_p)
+                            t = len(mc) + len(ml)
+                            if t >= MIN_OK or (t >= MIN_OK_LOOSE and len(mc) >= 1):
+                                ms.append({"fa": a, "fb": b, "mc": mc, "ml": ml, "t": t,
+                                           "_fa_idx": ia, "_fb_idx": ib})
+            else:
+                ms = match_planar(fa_list, fb_list, cyl_tol_p, line_tol_p)
+
             if ms:
                 ms.sort(key=lambda m: m["t"], reverse=True)
                 planar_pairs.append((na, nb, ms))
@@ -975,16 +1117,27 @@ def match_all(parts, world_step=None):
             dot = na[0]*nb[0] + na[1]*nb[1] + na[2]*nb[2]
             if dot < -0.7:
                 bonus += 50
-            # 面积相似加分 & 比例惩罚：一面远大于另一面是通用面误匹配
+            # 拓扑签名匹配加分（替代面积比惩罚——签名相同则面积自然对齐）
+            st_a = m["fa"].get("surface_type", "")
+            st_b = m["fb"].get("surface_type", "")
+            if st_a and st_b and st_a == st_b:
+                bonus += 50  # 面类型相同（plane⇔plane, cylinder⇔cylinder）
+            nloops_a = m["fa"].get("n_internal_loops", 0)
+            nloops_b = m["fb"].get("n_internal_loops", 0)
+            if nloops_a == nloops_b and nloops_a > 0:
+                bonus += 30  # 内孔数相同（如 4 螺栓孔 ⇔ 4 螺栓孔）
+            n_nb_a = len(m["fa"].get("neighbors", []))
+            n_nb_b = len(m["fb"].get("neighbors", []))
+            if n_nb_a > 0 and n_nb_a == n_nb_b:
+                bonus += 20  # 邻接面数相同 → 拓扑结构一致
+
+            # 面积适度加分（保留正向激励，移除惩罚——签名已过滤假阳性）
             area_a = m["fa"].get("area", 0)
             area_b = m["fb"].get("area", 0)
             if area_a > 0 and area_b > 0:
                 ratio = min(area_a, area_b) / max(area_a, area_b)
                 if ratio > 0.5:   bonus += 30
                 elif ratio > 0.2: bonus += 10
-                elif ratio < 0.05: bonus -= 200  # 20x差异→PCB通用面
-                elif ratio < 0.1:  bonus -= 100  # 10x差异
-                elif ratio < 0.2:  bonus -= 20   # 5x差异，轻度惩罚
             # 引脚阵列匹配：两面都有同桶引脚阵列 → 插座-CPU 强信号
             pas_a = m["fa"].get("pin_arrays", [])
             pas_b = m["fb"].get("pin_arrays", [])
@@ -1081,6 +1234,45 @@ def match_all(parts, world_step=None):
             is_primary = (m is primary)
             if is_primary:
                 idx[0] += 1
+                # BFS 拓扑传播验证
+                topo_a_chk = parts[na]["features"].get("topology_graph")
+                topo_b_chk = parts[nb]["features"].get("topology_graph")
+                if topo_a_chk and topo_b_chk:
+                    # 优先用匹配时存储的面索引，回退到全量列表的中心匹配
+                    fa_idx_chk = m.get("_fa_idx", -1)
+                    fb_idx_chk = m.get("_fb_idx", -1)
+                    if fa_idx_chk < 0 or fb_idx_chk < 0:
+                        # 回退：在全量面列表中通过中心+面积查找
+                        fa_full = parts[na]["features"]["planar"]
+                        fb_full = parts[nb]["features"]["planar"]
+                        fa_c = m["fa"]["c"]; fa_area = m["fa"]["area"]
+                        fb_c = m["fb"]["c"]; fb_area = m["fb"]["area"]
+                        fa_idx_chk = next((i for i, f in enumerate(fa_full)
+                            if abs(f["c"][0]-fa_c[0])<0.1 and abs(f["c"][1]-fa_c[1])<0.1
+                            and abs(f["c"][2]-fa_c[2])<0.1 and abs(f["area"]-fa_area)<1.0), -1)
+                        fb_idx_chk = next((i for i, f in enumerate(fb_full)
+                            if abs(f["c"][0]-fb_c[0])<0.1 and abs(f["c"][1]-fb_c[1])<0.1
+                            and abs(f["c"][2]-fb_c[2])<0.1 and abs(f["area"]-fb_area)<1.0), -1)
+                        # 用全量列表替换
+                        if fa_idx_chk >= 0 and fb_idx_chk >= 0:
+                            fa_list_bfs = fa_full
+                            fb_list_bfs = fb_full
+                        else:
+                            fa_list_bfs = fa_list; fb_list_bfs = fb_list
+                    else:
+                        fa_list_bfs = fa_list; fb_list_bfs = fb_list
+                    if fa_idx_chk >= 0 and fb_idx_chk >= 0:
+                        b_ok, b_info = _bfs_verify_pair(
+                            fa_idx_chk, fb_idx_chk, topo_a_chk, topo_b_chk, fa_list_bfs, fb_list_bfs)
+                        if not b_ok:
+                            print(f"  [BFS-REJECT] {na[:20]}<->{nb[:20]}: "
+                                  f"topology mismatch (matched={b_info['matched_pairs']} pairs)")
+                        else:
+                            print(f"  [BFS-OK] {na[:20]}<->{nb[:20]}: "
+                                  f"BFS verified {b_info['matched_pairs']} pairs depth={b_info['depth_reached']}")
+                    else:
+                        print(f"  [BFS-SKIP] {na[:20]}<->{nb[:20]}: "
+                              f"face not found in list (fa={fa_idx_chk} fb={fb_idx_chk})")
             is_array_a = _is_circular_array(m["fa"])
             is_array_b = _is_circular_array(m["fb"])
             array_bonus = " [ARRAY]" if (is_array_a and is_array_b) else ""

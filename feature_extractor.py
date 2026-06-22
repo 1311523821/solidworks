@@ -10,7 +10,12 @@ import os, sys, json, math
 import cadquery as cq
 import numpy as np
 from cadquery import importers
-from OCP.BRepAdaptor import BRepAdaptor_Surface
+from OCP.BRepAdaptor import BRepAdaptor_Surface, BRepAdaptor_Curve
+from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE, TopAbs_WIRE
+from OCP.TopExp import TopExp, TopExp_Explorer
+from OCP.TopTools import TopTools_IndexedDataMapOfShapeListOfShape
+from OCP.TopoDS import TopoDS
+from OCP.gp import gp_Pnt, gp_Vec
 
 # ===== 无量纲全局常数 =====
 # 所有几何阈值表达为零件特征尺寸 L（包围盒对角线长度）的无量纲比率，
@@ -135,6 +140,147 @@ def _principal_axes(shape):
     axes = [cq.Vector(float(eigenvecs[0, i]), float(eigenvecs[1, i]), float(eigenvecs[2, i]))
             for i in final_order]
     return centroid, axes
+
+
+# ==================== AAG: 属性邻接图 ====================
+def _classify_face_type(face):
+    """分类 B-Rep 面类型 → 'plane'|'cylinder'|'cone'|'sphere'|'torus'|'spline'|'other'"""
+    adaptor = BRepAdaptor_Surface(face.wrapped, True)
+    type_map = {
+        0: 'plane', 1: 'cylinder', 2: 'cone', 3: 'sphere',
+        4: 'torus', 5: 'bezier', 6: 'spline', 7: 'revolution',
+        8: 'extrusion', 9: 'offset', 10: 'other'
+    }
+    return type_map.get(adaptor.GetType(), 'other')
+
+
+def _classify_edge_convexity(face_a_wrapped, face_b_wrapped, shared_edge_wrapped, centroid):
+    """
+    参数化无关的边凸凹性分类。
+
+    原理：n_a · u_b 的符号决定凸凹性，其中 u_b = sign * (t_raw × n_b)
+    是指向面 B 内部的测地线切向量。用零件质心消除切向量方向二义性。
+
+    返回: 'convex' | 'concave' | 'tangent'
+    """
+    # 1. 边中点 + 切向量
+    adapt = BRepAdaptor_Curve(shared_edge_wrapped)
+    mid_param = (adapt.FirstParameter() + adapt.LastParameter()) / 2.0
+    pnt = gp_Pnt(); vec = gp_Vec()
+    adapt.D1(mid_param, pnt, vec)
+    P = cq.Vector(pnt.X(), pnt.Y(), pnt.Z())
+    t_raw = cq.Vector(vec.X(), vec.Y(), vec.Z())
+    if t_raw.Length < 1e-12:
+        return 'tangent'
+
+    # 2. 两面法向
+    n_a = cq.Face(face_a_wrapped).normalAt(P)
+    n_b = cq.Face(face_b_wrapped).normalAt(P)
+
+    # 3. u_b = t_raw × n_b（面B内垂直于边的切向量）
+    u_b = t_raw.cross(n_b)
+    if u_b.Length < 1e-9:
+        return 'tangent'
+    u_b = u_b.normalized()
+
+    # 4. 用质心修正 u_b 方向：指向面内（面B的质心方向）
+    #    centroid 是实体的质心 (C - P) 在面B上的投影应指向面内
+    to_centroid = centroid - P
+    if to_centroid.dot(u_b) < 0:
+        u_b = -u_b  # u_b 指向面外 → 取反
+
+    # 5. 凸凹性判定
+    dot_val = n_a.dot(u_b)
+    if dot_val > 1e-6:
+        return 'concave'   # n_a 指向面B内部 → 凹边
+    elif dot_val < -1e-6:
+        return 'convex'    # n_a 指向面B外部 → 凸边
+    else:
+        return 'tangent'
+
+
+def _build_aag(shape, centroid):
+    """
+    基于 OpenCASCADE TopExp 接口的 O(N) 属性邻接图构建。
+    节点包含零件的「所有面」（平面+圆柱+锥面等），确保法兰密封面的圆柱孔邻居能被表达。
+
+    返回: {"nodes": [...], "edges": [...]}
+    """
+    all_faces = list(shape.faces().vals())
+    total_area = sum(f.Area() for f in all_faces)
+
+    # 1. 全量面节点（含非平面）
+    nodes = []
+    face_map_idx = {}  # CadQuery Face id(f) → AAG node index（Python 对象生命周期稳定）
+    for idx, f in enumerate(all_faces):
+        surface_type = _classify_face_type(f)
+
+        wire_count = 0
+        explorer = TopExp_Explorer(f.wrapped, TopAbs_WIRE)
+        while explorer.More():
+            wire_count += 1
+            explorer.Next()
+        n_internal_loops = max(0, wire_count - 1)
+
+        nodes.append({
+            "type": surface_type,
+            "area_ratio": round(f.Area() / total_area, 4) if total_area > 0 else 0,
+            "n_internal_loops": n_internal_loops,
+            "area": round(f.Area(), 1),
+        })
+        face_map_idx[id(f)] = idx  # 稳定的 Python 对象引用
+
+    # 2. TopExp EDGE→FACES 映射（O(N) 线性时间）
+    edge_map = TopTools_IndexedDataMapOfShapeListOfShape()
+    TopExp.MapShapesAndAncestors_s(shape.val().wrapped, TopAbs_EDGE, TopAbs_FACE, edge_map)
+
+    aag_edges = []
+    for i in range(1, edge_map.Extent() + 1):
+        edge_wrapped = TopoDS.Edge_s(edge_map.FindKey(i))
+        face_list = edge_map.FindFromIndex(i)
+
+        # 仅处理两面临接的流形边
+        if face_list.Extent() != 2:
+            continue
+
+        # 显式下转型：TopExp 返回 TopoDS_Shape，需转为 TopoDS_Face
+        fa_wrapped = TopoDS.Face_s(face_list.First())
+        fb_wrapped = TopoDS.Face_s(face_list.Last())
+
+        # 通过 IsSame 匹配节点索引（安全避开 id(wrapped) 临时对象陷阱）
+        src = dst = None
+        for idx, f in enumerate(all_faces):
+            if src is None and f.wrapped.IsSame(fa_wrapped):
+                src = idx
+            if dst is None and f.wrapped.IsSame(fb_wrapped):
+                dst = idx
+            if src is not None and dst is not None:
+                break
+
+        if src is None or dst is None:
+            continue
+
+        convexity = 'unknown'; edge_geom = 'unknown'; edge_len = 0.0
+        try:
+            convexity = _classify_edge_convexity(
+                fa_wrapped, fb_wrapped, edge_wrapped, centroid)
+            etypes = {0:'line',1:'circle',2:'ellipse',3:'hyperbola',
+                      4:'parabola',5:'bezier',6:'spline',7:'offset',8:'other'}
+            eadapt = BRepAdaptor_Curve(edge_wrapped)
+            edge_geom = etypes.get(eadapt.GetType(), 'unknown')
+            from OCP.GCPnts import GCPnts_AbscissaPoint
+            edge_len = GCPnts_AbscissaPoint.Length_s(eadapt)
+        except Exception:
+            pass
+
+        aag_edges.append({
+            "src": src, "dst": dst,
+            "convexity": convexity,
+            "edge_geom": edge_geom,
+            "edge_len": round(edge_len, 3),
+        })
+
+    return {"nodes": nodes, "edges": aag_edges}
 
 
 # ==================== planar + 面形描述符 ====================
@@ -497,11 +643,44 @@ def extract_file(filepath):
     centroid, principal_axes = _principal_axes(shape)
     planar = extract_planar(shape, L, principal_axes[0])
     cylinders = extract_cylinders(shape, L, principal_axes[0])
+
+    # 构建全量面拓扑邻接图（含平面+圆柱面等，法兰的圆柱孔邻居可被表达）
+    centroid_vec = cq.Vector(centroid.x, centroid.y, centroid.z)
+    topo = _build_aag(shape, centroid_vec)
+
+    # 将 planar faces 映射到全量 AAG 节点中（面中心+面积双重校验）
+    all_faces = list(shape.faces().vals())
+    for pf in planar:
+        pf_c = pf["c"]; pf_area = pf["area"]
+        match_idx = -1
+        for idx, f in enumerate(all_faces):
+            c = f.Center()
+            if (abs(c.x - pf_c[0]) < 0.1 and abs(c.y - pf_c[1]) < 0.1
+                    and abs(c.z - pf_c[2]) < 0.1 and abs(f.Area() - pf_area) < 1.0):
+                match_idx = idx
+                break
+        if match_idx >= 0:
+            node = topo["nodes"][match_idx]
+            pf["surface_type"] = node["type"]
+            pf["n_internal_loops"] = node["n_internal_loops"]
+            # 允许平面邻域包含非平面邻居（核心修正！法兰面→圆柱孔边被正确表达）
+            pf["neighbors"] = [
+                {"idx": e["dst"] if e["src"] == match_idx else e["src"],
+                 "convexity": e["convexity"],
+                 "edge_geom": e["edge_geom"]}
+                for e in topo["edges"] if e["src"] == match_idx or e["dst"] == match_idx
+            ]
+        else:
+            pf["surface_type"] = 'plane'
+            pf["n_internal_loops"] = 0
+            pf["neighbors"] = []
+
     features = {
         "planar": planar, "cylinders": cylinders,
         "diag_len": round(L, 1),
         "principal_axes": [[a.x, a.y, a.z] for a in principal_axes],
         "centroid": [centroid.x, centroid.y, centroid.z],
+        "topology_graph": topo,
     }
     features["_summary"] = summary(features, L)
     return features
