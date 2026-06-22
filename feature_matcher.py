@@ -8,9 +8,48 @@ feature_matcher.py
 import os, sys, json, math
 import cadquery as cq
 from label_generator import planar_labels, cylinder_labels, _bore_face_intersection, _neg, _vec_sub, mk_label, fmt_json, _ortho
+from feature_extractor import (
+    quantize_radius,
+    ALPHA_FACE_AREA, BETA_CYL_RADIUS, GAMMA_CYL_MATCH, GAMMA_LINE_MATCH,
+    GAMMA_DIST_NEAR, GAMMA_DIST_FAR, GAMMA_RECT_PAIR_TOL, GAMMA_RECT_ABS_FLOOR,
+    ETA_SLOT_ASPECT, BETA_SLOT_AREA_MIN, BETA_SLOT_AREA_MAX,
+    ETA_SPIGOT_R_MIN, ETA_SPIGOT_STEP, ETA_FRAME_EDGE_MIN, ETA_FRAME_FACE_AREA_MIN,
+    ZETA_AXIAL_ALIGN, ZETA_AXIAL_END_LO, ZETA_AXIAL_END_HI,
+    MIN_CIRCLES_FOR_ARRAY, MIN_CYL_FOR_SPLINE, MIN_FACES_FOR_CONCENTRIC,
+    MIN_CIRCLES_FOR_PIN_ARRAY, MIN_LINES_FOR_RECT,
+)
 
-TOL = 0.1; MIN_OK = 3; MIN_OK_LOOSE = 2; CYL_TOL = 0.5; SLOT_MIN = 2
+# 无量纲全局常数（零件尺寸自适应，具体数值由 L = diag_len 决定）
+# match_all() 内部根据每对零件的 L 计算以下容差：
+#   tol_line = GAMMA_LINE_MATCH * L_avg
+#   tol_cyl  = GAMMA_CYL_MATCH * L_avg
+#   dist_near = GAMMA_DIST_NEAR * L_avg
+#   dist_far  = GAMMA_DIST_FAR * L_avg
+
+MIN_OK = 3; MIN_OK_LOOSE = 2; SLOT_MIN = 2
 MULTI_CYL_THRESHOLD = 50  # 超过此数量触发框架嵌入逻辑
+
+def _pair_L(parts, na, nb):
+    """获取零件对的平均特征尺寸 L（mm）"""
+    la = parts[na]["features"].get("diag_len", 100)
+    lb = parts[nb]["features"].get("diag_len", 100)
+    return (la + lb) / 2.0
+
+
+def _get_principal_axis(parts, name):
+    """获取零件的主惯性轴（index 0），回退到全局 Z。
+    用惯性张量 PCA 替代硬编码全局 Z 轴，实现旋转不变。"""
+    axes = parts[name]["features"].get("principal_axes")
+    if axes and len(axes) > 0:
+        return cq.Vector(*axes[0])
+    return cq.Vector(0, 0, 1)
+
+
+def _is_axial(normal, parts, name):
+    """检查面法向是否与零件主惯性轴对齐（替代 abs(n[2]) > 0.7）。"""
+    pa = _get_principal_axis(parts, name)
+    n = cq.Vector(normal[0], normal[1], normal[2]) if not isinstance(normal, cq.Vector) else normal
+    return abs(n.dot(pa)) > ZETA_AXIAL_ALIGN
 
 
 def _match_list(la, lb, key, tol):
@@ -22,25 +61,24 @@ def _match_list(la, lb, key, tol):
     return m
 
 
-def match_planar(fa, fb):
+def match_planar(fa, fb, cyl_tol=0.5, line_tol=0.1):
     res = []
     for a in fa:
         for b in fb:
-            # 圆用半径匹配（CYL_TOL=0.5mm），替代周长 0.1mm（半径仅0.016mm过严）
-            mc = _match_list(a["circles"], b["circles"], "r", CYL_TOL)
-            ml = _match_list(a["lines"], b["lines"], "len", TOL)
+            mc = _match_list(a["circles"], b["circles"], "r", cyl_tol)
+            ml = _match_list(a["lines"], b["lines"], "len", line_tol)
             t = len(mc) + len(ml)
             if t >= MIN_OK or (t >= MIN_OK_LOOSE and len(mc) >= 1):
                 res.append({"fa": a, "fb": b, "mc": mc, "ml": ml, "t": t})
     return res
 
 
-def match_slot(fa, fb):
+def match_slot(fa, fb, cyl_tol=0.5, line_tol=0.1):
     res = []
     for a in fa:
         for b in fb:
-            mc = _match_list(a["circles"], b["circles"], "r", CYL_TOL)
-            ml = _match_list(a["lines"], b["lines"], "len", TOL)
+            mc = _match_list(a["circles"], b["circles"], "r", cyl_tol)
+            ml = _match_list(a["lines"], b["lines"], "len", line_tol)
             t = len(mc) + len(ml)
             if t >= SLOT_MIN:
                 res.append({"fa": a, "fb": b, "mc": mc, "ml": ml, "t": t})
@@ -54,7 +92,6 @@ def _bucket_key(cyl):
     if bucket is not None:
         return bucket
     # 旧文件兼容：现场分桶
-    from feature_extractor import quantize_radius
     return quantize_radius(r)
 
 
@@ -77,7 +114,8 @@ def _classify_match(m):
     return "shaft-bore"
 
 
-def match_cylinders(ca, cb, strict_axis=False, ref_a=None, ref_b=None):
+def match_cylinders(ca, cb, strict_axis=False, ref_a=None, ref_b=None,
+                    face_info_a=None, face_info_b=None, cyl_tol=0.5):
     """圆柱匹配：桶索引 O(k²) 替代笛卡尔积 O(n×m)"""
     # 构建 cb 的桶索引
     cb_index = {}
@@ -96,14 +134,24 @@ def match_cylinders(ca, cb, strict_axis=False, ref_a=None, ref_b=None):
         for b_idx, b in cb_index[bk]:
             same_type = a["ext"] == b["ext"]
             if same_type and a["ext"]: continue  # 跳过轴-轴
-            if abs(a["r"] - b["r"]) > CYL_TOL: continue
+            if abs(a["r"] - b["r"]) > cyl_tol: continue
             if strict_axis:
                 dot = abs(a["dir"][0]*b["dir"][0] + a["dir"][1]*b["dir"][1] + a["dir"][2]*b["dir"][2])
                 if dot < 0.9: continue
-            if ref_a and ref_b and strict_axis:
+            # 空间邻近检查：独立于 strict_axis，只要 ref 可用就检查
+            if ref_a and ref_b:
                 da = sum((a["mid"][k] - ref_a[k])**2 for k in range(3))**0.5
                 db = sum((b["mid"][k] - ref_b[k])**2 for k in range(3))**0.5
                 if abs(da - db) > 5: continue
+                # 自适应距离阈值：基于参考面面积（大面允许远圆柱，小面严格限制）
+                area_a = face_info_a.get("area", 0) if face_info_a else 0
+                area_b = face_info_b.get("area", 0) if face_info_b else 0
+                ref_area = max(area_a, area_b)
+                # threshold = max(sqrt(face_area) * 2, 30)mm
+                # CPU座(661mm²)→51mm, DIMM槽(526mm²)→46mm, 大机箱面→max 447mm
+                max_dist = max(math.sqrt(ref_area) * 2, 30) if ref_area > 0 else 150
+                if da > max_dist or db > max_dist:
+                    continue
             if same_type:  # 孔-孔（bore-to-bore）
                 if b_idx in used_b: continue
                 if a_idx in used_a: continue
@@ -182,15 +230,16 @@ def _is_circular_array(face):
     median_r = sorted(radii)[len(radii)//2]
     same_r = sum(1 for r in radii if abs(r - median_r) < 0.5)
     if same_r < 3: return False
-    # 计算圆心的中心点
+    # 计算圆心的中心点（3D，覆盖非Z主导面）
     cx = sum(c["c"][0] for c in circles) / len(circles)
     cy = sum(c["c"][1] for c in circles) / len(circles)
+    cz = sum(c["c"][2] for c in circles) / len(circles)
     # 检查同半径圆到中心的距离是否相近
     dists = []
     for c in circles:
         r = c["len"] / (2*math.pi)
         if abs(r - median_r) < 0.5:
-            d = ((c["c"][0]-cx)**2 + (c["c"][1]-cy)**2)**0.5
+            d = ((c["c"][0]-cx)**2 + (c["c"][1]-cy)**2 + (c["c"][2]-cz)**2)**0.5
             dists.append(d)
     if len(dists) < 3: return False
     median_d = sorted(dists)[len(dists)//2]
@@ -257,20 +306,21 @@ def _match_frame_edges(a_lines, b_lines, tol=1.0):
 
 
 def _match_lines_spatial(a_lines, b_lines, a_center, b_center, len_tol=1.0):
-    """匹配线段：长度相近 + 相对面中心的方向一致（上方配上方，左方配左方）"""
+    """匹配线段：长度相近 + 相对面中心的3D方向一致（上方配上方，左方配左方）"""
     matched = []
     used_b = [False] * len(b_lines)
 
     for al in a_lines:
         if al["len"] < 10:  # 只匹配框架长边（≥10mm），忽略内部短边
             continue
-        # FAN线段指向
+        # A线段3D指向（面心→线段中点）
         adx = al["m"][0] - a_center[0]
         ady = al["m"][1] - a_center[1]
-        alen = (adx**2 + ady**2) ** 0.5
+        adz = al["m"][2] - a_center[2]
+        alen = (adx**2 + ady**2 + adz**2) ** 0.5
         if alen < 1e-6:
             continue
-        adir = (adx / alen, ady / alen)
+        adir = (adx / alen, ady / alen, adz / alen)
 
         best_j, best_score = -1, float("inf")
         for j, bl in enumerate(b_lines):
@@ -281,15 +331,16 @@ def _match_lines_spatial(a_lines, b_lines, a_center, b_center, len_tol=1.0):
             len_diff = abs(al["len"] - bl["len"])
             if len_diff > len_tol:
                 continue
-            # CAGE线段指向
+            # B线段3D指向
             bdx = bl["m"][0] - b_center[0]
             bdy = bl["m"][1] - b_center[1]
-            blen = (bdx**2 + bdy**2) ** 0.5
+            bdz = bl["m"][2] - b_center[2]
+            blen = (bdx**2 + bdy**2 + bdz**2) ** 0.5
             if blen < 1e-6:
                 continue
-            bdir = (bdx / blen, bdy / blen)
-            # 方向相似度（dot > 0.7 ≈ 夹角 < 45°，同一象限）
-            dot = adir[0] * bdir[0] + adir[1] * bdir[1]
+            bdir = (bdx / blen, bdy / blen, bdz / blen)
+            # 3D方向相似度（dot > 0.7 ≈ 夹角 < 45°，同一象限）
+            dot = adir[0] * bdir[0] + adir[1] * bdir[1] + adir[2] * bdir[2]
             if dot < 0.7:
                 continue
             score = len_diff + (1 - dot) * 10
@@ -318,7 +369,7 @@ def _find_cage_frame_candidates(planar_faces):
     return candidates
 
 
-def _frame_in_frame(na, nb, parts, labels, idx_counter, face_info, used_p, fif_slot_centers):
+def _frame_in_frame(na, nb, parts, labels, idx_counter, face_info, used_p, fif_slot_centers, cyl_tol=0.5):
     """
     框架嵌入匹配：一个零件的框架嵌入另一个零件的槽位。
     策略：遍历所有FAN框架面 → 与CAGE槽面匹配 → 选无碰撞的最佳组合。
@@ -443,7 +494,7 @@ def _frame_in_frame(na, nb, parts, labels, idx_counter, face_info, used_p, fif_s
                                           fan_frame["c"], f["c"], len_tol=999.0)
             if len(ml) < 1:
                 continue
-            mc = _match_list(fan_frame.get("circles", []), f.get("circles", []), "r", CYL_TOL)
+            mc = _match_list(fan_frame.get("circles", []), f.get("circles", []), "r", cyl_tol)
             if not _check_fit(fan_frame, f):
                 continue
             len_penalty = sum(abs(al["len"] - bl["len"]) for al, bl in ml)
@@ -525,9 +576,6 @@ def _frame_in_frame(na, nb, parts, labels, idx_counter, face_info, used_p, fif_s
                     if (cage_cand["n"][2] > 0 and cf["c"][2] > inner_z) or \
                        (cage_cand["n"][2] < 0 and cf["c"][2] < inner_z):
                         inner_z = cf["c"][2]
-                    if (cage_cand["n"][2] > 0 and cf["c"][2] > inner_z) or \
-                       (cage_cand["n"][2] < 0 and cf["c"][2] < inner_z):
-                        inner_z = cf["c"][2]
         if abs(inner_z - cage_cand["c"][2]) > 1.0:
             lb["geometry"]["origin"]["z"] += (inner_z - cage_cand["c"][2])
 
@@ -536,7 +584,7 @@ def _frame_in_frame(na, nb, parts, labels, idx_counter, face_info, used_p, fif_s
         bolt_zs = []
         for bf in all_fan_faces:
             if abs(bf["c"][0] - ff["c"][0]) < 30 and abs(bf["c"][1] - ff["c"][1]) < 30:
-                if abs(bf["n"][2]) > 0.7 and len(bf.get("circles", [])) >= 2:
+                if _is_axial(bf["n"], parts, fan_name) and len(bf.get("circles", [])) >= 2:
                     bolt_zs.append(bf["c"][2])
         if bolt_zs:
             # 取 Z 最大（最靠近 CAGE 格栅侧）= 前端面
@@ -565,6 +613,8 @@ def _frame_in_frame(na, nb, parts, labels, idx_counter, face_info, used_p, fif_s
         print(f"  [{idx}] {na_real}<->{nb_real}: {len(mc)}c+{len(ml)}l"
               f" @({cage_cand['c'][0]:.0f},{cage_cand['c'][1]:.0f}) [FRAME-IN-FRAME]")
         found_any = True
+
+    return found_any
 
 
 # ========== 验证辅助函数 ==========
@@ -784,6 +834,8 @@ def match_all(parts, world_step=None):
     face_info = {}; used_p = {}; slot_faces = {}; face_csys = {}
     discarded_planar_matches = {}  # {(na, nb): (kept_match, [discarded])}
     pairs_with_labels = set()  # 已有标签的零件对，Step 3 跳过
+    planar_primary_pairs = set()  # 所有获得 PRIMARY PLANAR 标签的零件对（用于共享邻居过滤）
+    _primary_origins = {}  # (na, nb) → (origin_a, origin_b) 用于空间冲突检测
     ky_name = next((n for n in names if "key" in n.lower()), None)
     sh_name = next((n for n in names if "shaft" in n.lower()), None)
 
@@ -805,14 +857,15 @@ def match_all(parts, world_step=None):
             pa = len(parts[names[i]]["features"]["planar"])
             pb = len(parts[names[j]]["features"]["planar"])
             if pa > 500 and pb > 500: continue
-            if len(ca) > MULTI_CYL_THRESHOLD and len(cb) > MULTI_CYL_THRESHOLD:
+            if len(ca) > MULTI_CYL_THRESHOLD or len(cb) > MULTI_CYL_THRESHOLD:
                 multi_cyl_pairs.append((names[i], names[j]))
 
     processed_fif = set()
     fif_slot_centers = {}  # cage_name -> [(cx, cy, frame_size), ...] 均在CAGE CS内
     for na, nb in multi_cyl_pairs:
         before_labels = sum(len(labels[n]) for n in [na, nb])
-        _frame_in_frame(na, nb, parts, labels, idx, face_info, used_p, fif_slot_centers)
+        Lf = _pair_L(parts, na, nb)
+        _frame_in_frame(na, nb, parts, labels, idx, face_info, used_p, fif_slot_centers, GAMMA_CYL_MATCH * Lf)
         after_labels = sum(len(labels[n]) for n in [na, nb])
         if after_labels > before_labels:
             processed_fif.add((na, nb))
@@ -841,7 +894,10 @@ def match_all(parts, world_step=None):
                 fa_list = sorted(fa_list, key=lambda f: f.get("area", 0), reverse=True)[:100]
             if pb > 100:
                 fb_list = sorted(fb_list, key=lambda f: f.get("area", 0), reverse=True)[:100]
-            ms = match_planar(fa_list, fb_list)
+            Lp = _pair_L(parts, na, nb)
+            cyl_tol_p = GAMMA_CYL_MATCH * Lp
+            line_tol_p = GAMMA_LINE_MATCH * Lp
+            ms = match_planar(fa_list, fb_list, cyl_tol_p, line_tol_p)
             if ms:
                 ms.sort(key=lambda m: m["t"], reverse=True)
                 planar_pairs.append((na, nb, ms))
@@ -864,8 +920,44 @@ def match_all(parts, world_step=None):
                 fc_a = cq.Vector(m["fa"]["c"][0], m["fa"]["c"][1], m["fa"]["c"][2])
                 fc_b = cq.Vector(m["fb"]["c"][0], m["fb"]["c"][1], m["fb"]["c"][2])
                 if fc_a.sub(bc_a).dot(n_a) < 0 or fc_b.sub(bc_b).dot(n_b) < 0: continue
-            # 面法向检查：t≥3的高质量匹配跳过（管法兰、弯头等非直对场景）
-            if m["t"] < MIN_OK and n_a.dot(n_b) > -0.5:
+            # 面心距离过滤：面贴面配合的两面需满足：
+            # 1. 总距离不超过两面半径之和（含容差）
+            # 2. 面心在面平面内的投影距离不超过较大面的半径（面心应对齐）
+            fc_a_v = cq.Vector(m["fa"]["c"][0], m["fa"]["c"][1], m["fa"]["c"][2])
+            fc_b_v = cq.Vector(m["fb"]["c"][0], m["fb"]["c"][1], m["fb"]["c"][2])
+            face_dist = fc_a_v.sub(fc_b_v).Length
+            area_a = m["fa"].get("area", 0); area_b = m["fb"].get("area", 0)
+            base_reach = math.sqrt(area_a) + math.sqrt(area_b)
+            max_reach = base_reach * 1.5 if base_reach < 100 else base_reach * 1.2
+            if face_dist > max_reach and m["t"] < 10:
+                continue
+            # 面平面内投影距离：面心向量在法向方向的投影，去除法向分量后剩余的距离
+            # 两个面心应在面平面内对齐（投影距离 < 较大面的半径）
+            if m["t"] < 10:
+                n_avg = n_a.sub(n_b if n_a.dot(n_b) < 0 else n_b.multiply(-1)).normalized()
+                delta = fc_a_v.sub(fc_b_v)
+                proj_along_normal = abs(delta.dot(n_avg))
+                proj_in_plane = (delta.sub(n_avg.multiply(proj_along_normal))).Length
+                max_in_plane = max(math.sqrt(area_a), math.sqrt(area_b)) * 1.5
+                if proj_in_plane > max_in_plane:
+                    continue
+            # 面积比过滤：一面比另一面小 10 倍以上 → 不是真正的配合面
+            # （如螺栓凸台小面 vs 法兰大面，虽有圆匹配但面积悬殊）
+            if area_a > 0 and area_b > 0:
+                area_ratio = min(area_a, area_b) / max(area_a, area_b)
+                if area_ratio < 0.1 and m["t"] < MIN_OK:
+                    continue
+            # 面法向检查：
+            # dot < -0.3 → 面对面配合（正常面贴面）
+            # dot > 0.7 + 面积比 > 0.3 + 两者无圆柱 → 键/槽嵌入配合（法向相同=键底面贴合键槽底面）
+            dot_ab = n_a.dot(n_b)
+            is_keyway = (dot_ab > 0.7 and area_a > 0 and area_b > 0
+                         and min(area_a, area_b) / max(area_a, area_b) > 0.3
+                         and len(parts[na]["features"]["cylinders"]) == 0
+                         and len(parts[nb]["features"]["cylinders"]) <= 1)
+            # 法向检查：dot<-0.3=面对面；dot>0.7=键/槽
+            # t>=6 的强匹配可能是局部CS差异，不应因法向不平行拒绝
+            if dot_ab > -0.3 and not is_keyway and m["t"] < 6:
                 continue
             ca = len(parts[na]["features"]["cylinders"])
             cb = len(parts[nb]["features"]["cylinders"])
@@ -874,13 +966,98 @@ def match_all(parts, world_step=None):
             valid.append(m)
         if not valid: continue
 
-        # 排序：t 得分 + 圆周阵列加权（螺栓孔面优先）
+        # 排序：t 得分 + 法向对齐 + 面积相似 + 圆周阵列
         def _score(m):
-            bonus = 100 if (_is_circular_array(m["fa"])
-                        and _is_circular_array(m["fb"])) else 0
+            bonus = 0
+            if _is_circular_array(m["fa"]) and _is_circular_array(m["fb"]):
+                bonus += 100
+            na = m["fa"]["n"]; nb = m["fb"]["n"]
+            dot = na[0]*nb[0] + na[1]*nb[1] + na[2]*nb[2]
+            if dot < -0.7:
+                bonus += 50
+            # 面积相似加分 & 比例惩罚：一面远大于另一面是通用面误匹配
+            area_a = m["fa"].get("area", 0)
+            area_b = m["fb"].get("area", 0)
+            if area_a > 0 and area_b > 0:
+                ratio = min(area_a, area_b) / max(area_a, area_b)
+                if ratio > 0.5:   bonus += 30
+                elif ratio > 0.2: bonus += 10
+                elif ratio < 0.05: bonus -= 200  # 20x差异→PCB通用面
+                elif ratio < 0.1:  bonus -= 100  # 10x差异
+                elif ratio < 0.2:  bonus -= 20   # 5x差异，轻度惩罚
+            # 引脚阵列匹配：两面都有同桶引脚阵列 → 插座-CPU 强信号
+            pas_a = m["fa"].get("pin_arrays", [])
+            pas_b = m["fb"].get("pin_arrays", [])
+            shared_pins = set(p["bucket"] for p in pas_a) & set(p["bucket"] for p in pas_b)
+            if shared_pins:
+                bonus += 80  # 引脚阵列同桶 → 极强匹配
+            # 槽口匹配
+            if m["fa"].get("is_slot") and m["fb"].get("is_slot"):
+                if m["fa"].get("z_dominant") and m["fb"].get("z_dominant"):
+                    bonus += 60
+            # 孔距匹配：两面共享 ≥2 个孔间距 → 螺栓/引脚阵列强信号
+            dists_a = set(m["fa"].get("inter_circle_dists", []))
+            dists_b = set(m["fb"].get("inter_circle_dists", []))
+            shared_dists = dists_a & dists_b
+            if len(shared_dists) >= 3:
+                bonus += 100  # ≥3 个共同间距 → 几乎是确定匹配
+            elif len(shared_dists) >= 2:
+                bonus += 50
+            elif len(shared_dists) >= 1:
+                bonus += 20
             return m["t"] + bonus
         valid.sort(key=_score, reverse=True)
         primary = valid[0]
+
+        # 侧面匹配：t<6 或 t≥50（PCB假阳性）→ Z-FACE；6≤t<50 保留（管法兰等）
+        # 但不切换小面积+多圆的连接器面（DIMM槽、插座等特定配合面）
+        # 也不切换键/槽嵌入配合（法向相同的面不是侧面配合）
+        na_p = primary["fa"]["n"]; nb_p = primary["fb"]["n"]
+        dot_primary = na_p[0]*nb_p[0] + na_p[1]*nb_p[1] + na_p[2]*nb_p[2]
+        is_keyway = dot_primary > 0.7
+        side_face = not _is_axial(na_p, parts, na) and not _is_axial(nb_p, parts, nb)
+        need_z = side_face and (primary["t"] < 6 or primary["t"] >= 50) and not is_keyway
+        if need_z and primary["t"] >= 6:
+            need_z = False  # 强匹配(>=6特征)即使非Z主导也保留
+        if need_z:
+            # 如果当前面是小面积+多圆 → 是连接器配合面，不切换
+            area_a_p = primary["fa"].get("area", 0)
+            area_b_p = primary["fb"].get("area", 0)
+            is_specific = area_a_p < 5000 and area_b_p < 5000
+            is_connector = len(primary["mc"]) >= MIN_OK
+            if is_specific and is_connector:
+                need_z = False
+                print(f"  [SIDE-KEEP] {na[:20]}<->{nb[:20]}: small connector face"
+                      f" (area={area_a_p:.0f}/{area_b_p:.0f}, {len(primary['mc'])}c+{len(primary['ml'])}l), keep side face")
+        if need_z:
+            z_candidates = [m for m in valid if _is_axial(m["fa"]["n"], parts, na) or _is_axial(m["fb"]["n"], parts, nb)]
+            # Z 面中优先选有引脚阵列的（插座/CPU匹配）
+            if z_candidates and len(z_candidates) > 1:
+                z_candidates.sort(key=lambda m: (
+                    len(m["fa"].get("pin_arrays",[])) + len(m["fb"].get("pin_arrays",[]))
+                ), reverse=True)
+            if z_candidates:
+                z_candidates.sort(key=lambda m: m["t"], reverse=True)
+                primary = z_candidates[0]
+                print(f"  [Z-FACE] {na[:20]}<->{nb[:20]}: Z face selected (t={primary['t']},"
+                      f" {len(primary['mc'])}c+{len(primary['ml'])}l)"
+                      f" nA=({primary['fa']['n'][0]:.2f},{primary['fa']['n'][1]:.2f},{primary['fa']['n'][2]:.2f})"
+                      f" nB=({primary['fb']['n'][0]:.2f},{primary['fb']['n'][1]:.2f},{primary['fb']['n'][2]:.2f})"
+                      f" z_candidates={len(z_candidates)}")
+            else:
+                # 没有 Z 候选面，但可能有键/槽嵌入匹配（dot>0.7）→ 使用 keyway 作为 primary
+                keyway_candidates = [m for m in valid
+                    if m["fa"]["n"][0]*m["fb"]["n"][0]+m["fa"]["n"][1]*m["fb"]["n"][1]+m["fa"]["n"][2]*m["fb"]["n"][2] > 0.7]
+                if keyway_candidates:
+                    keyway_candidates.sort(key=_score, reverse=True)
+                    primary = keyway_candidates[0]
+                    print(f"  [KEYWAY] {na[:20]}<->{nb[:20]}: keyway face selected"
+                          f" (t={primary['t']}, {len(primary['mc'])}c+{len(primary['ml'])}l)"
+                          f" nA=({primary['fa']['n'][0]:.2f},{primary['fa']['n'][1]:.2f},{primary['fa']['n'][2]:.2f})"
+                          f" nB=({primary['fb']['n'][0]:.2f},{primary['fb']['n'][1]:.2f},{primary['fb']['n'][2]:.2f})")
+                else:
+                    print(f"  [NO-Z] {na[:20]}<->{nb[:20]}: no Z face, skip PLANAR (t={primary['t']})")
+                    continue
 
         # 法向多样性：>30° 的视为不同接触面（如键的底面+侧壁），保留最多3个
         kept = [primary]
@@ -916,17 +1093,89 @@ def match_all(parts, world_step=None):
                     match_all._flange_face_labels = []
                 match_all._flange_face_labels.append((na, nb, la, lb, m))
             if is_primary:
+                # 空间冲突检测：同一基板上两零件配合原点过近 → 尝试次优匹配
+                conflict_retries = 0
+                while conflict_retries < 3:
+                    conflict = False
+                    oa = m["fa"]["c"]; ob = m["fb"]["c"]
+                    for (prev_na, prev_nb), (prev_oa, prev_ob) in _primary_origins.items():
+                        # 检查是否共享零件
+                        if prev_na == na:
+                            dist = ((oa[0]-prev_oa[0])**2+(oa[1]-prev_oa[1])**2+(oa[2]-prev_oa[2])**2)**0.5
+                            if dist < 80:  # 同零件上两配合面 <80mm → 零件可能重叠
+                                conflict = True
+                                print(f"  [CONFLICT] {na}: {na[:15]}<->{nb[:15]} origin"
+                                      f" ({oa[0]:.0f},{oa[1]:.0f},{oa[2]:.0f}) vs"
+                                      f" {na[:15]}<->{prev_nb[:15]} origin"
+                                      f" ({prev_oa[0]:.0f},{prev_oa[1]:.0f},{prev_oa[2]:.0f})"
+                                      f" dist={dist:.0f}mm < 80mm")
+                        elif prev_na == nb:
+                            dist = ((ob[0]-prev_ob[0])**2+(ob[1]-prev_ob[1])**2+(ob[2]-prev_ob[2])**2)**0.5
+                            if dist < 80:
+                                conflict = True
+                                print(f"  [CONFLICT] {nb}: {na[:15]}<->{nb[:15]} origin"
+                                      f" ({ob[0]:.0f},{ob[1]:.0f},{ob[2]:.0f}) vs"
+                                      f" {nb[:15]}<->{prev_nb[:15]} origin"
+                                      f" ({prev_ob[0]:.0f},{prev_ob[1]:.0f},{prev_ob[2]:.0f})"
+                                      f" dist={dist:.0f}mm < 80mm")
+                        # 检查反向（prev 的 a == na 或 nb 等，同上逻辑处理 prev_nb）
+                        if prev_nb == na:
+                            dist = ((oa[0]-prev_ob[0])**2+(oa[1]-prev_ob[1])**2+(oa[2]-prev_ob[2])**2)**0.5
+                            if dist < 80:
+                                conflict = True
+                                print(f"  [CONFLICT] {na}: {na[:15]}<->{nb[:15]} origin"
+                                      f" ({oa[0]:.0f},{oa[1]:.0f},{oa[2]:.0f}) vs"
+                                      f" {prev_na[:15]}<->{na[:15]} origin"
+                                      f" ({prev_ob[0]:.0f},{prev_ob[1]:.0f},{prev_ob[2]:.0f})"
+                                      f" dist={dist:.0f}mm < 80mm")
+                        elif prev_nb == nb:
+                            dist = ((ob[0]-prev_ob[0])**2+(ob[1]-prev_ob[1])**2+(ob[2]-prev_ob[2])**2)**0.5
+                            if dist < 80:
+                                conflict = True
+                                print(f"  [CONFLICT] {nb}: {na[:15]}<->{nb[:15]} origin"
+                                      f" ({ob[0]:.0f},{ob[1]:.0f},{ob[2]:.0f}) vs"
+                                      f" {prev_na[:15]}<->{nb[:15]} origin"
+                                      f" ({prev_ob[0]:.0f},{prev_ob[1]:.0f},{prev_ob[2]:.0f})"
+                                      f" dist={dist:.0f}mm < 80mm")
+                    if not conflict:
+                        break
+                    # 尝试下一个 valid 匹配
+                    conflict_retries += 1
+                    remaining_valid = [vm for vm in valid if vm not in kept and vm is not m]
+                    if not remaining_valid:
+                        print(f"  [CONFLICT] no alternative for {na}<->{nb}, keeping original")
+                        conflict = False
+                        break
+                    # 选最近的替代
+                    remaining_valid.sort(key=_score, reverse=True)
+                    m = remaining_valid[0]
+                    kept = [m] + [k for k in kept if k is not m]
+                    la, lb = planar_labels(m, na, nb, idx[0])
+                    oa, ob = m["fa"]["c"], m["fb"]["c"]
+                    print(f"  [CONFLICT] retry #{conflict_retries}: {na[:15]}<->{nb[:15]}"
+                          f" -> origin ({oa[0]:.0f},{oa[1]:.0f},{oa[2]:.0f})")
+                if not conflict or conflict_retries == 0:
+                    _primary_origins[(na, nb)] = (m["fa"]["c"], m["fb"]["c"])
                 labels[na].append(la); labels[nb].append(lb)
+                planar_primary_pairs.add((na, nb))
             if na not in face_info:
-                face_info[na] = {"c": m["fa"]["c"], "n": m["fa"]["n"]}
+                face_info[na] = {"c": m["fa"]["c"], "n": m["fa"]["n"],
+                                 "area": m["fa"].get("area", 0)}
                 face_csys[na] = {"c": m["fa"]["c"], "n": m["fa"]["n"],
                                  "x": la["geometry"]["x"], "y": la["geometry"]["y"]}
             if nb not in face_info:
-                face_info[nb] = {"c": m["fb"]["c"], "n": m["fb"]["n"]}
+                face_info[nb] = {"c": m["fb"]["c"], "n": m["fb"]["n"],
+                                 "area": m["fb"].get("area", 0)}
                 face_csys[nb] = {"c": m["fb"]["c"], "n": m["fb"]["n"],
                                  "x": lb["geometry"]["x"], "y": lb["geometry"]["y"]}
 
-        pairs_with_labels.add((na, nb))
+        # 仅法向近似相反 + 至少一面 Z 主导时才阻止 CYL
+        # （两侧面面对面匹配不阻止——可能是插座/内存条等需要轴孔配合的场景）
+        n_pa = primary["fa"]["n"]; n_pb = primary["fb"]["n"]
+        face_dot = n_pa[0]*n_pb[0] + n_pa[1]*n_pb[1] + n_pa[2]*n_pb[2]
+        has_z_face = _is_axial(n_pa, parts, na) or _is_axial(n_pb, parts, nb)
+        if face_dot < -0.5 and has_z_face:
+            pairs_with_labels.add((na, nb))
 
         # 收集被丢弃的匹配用于验证
         remaining = [m for m in valid if m not in kept]
@@ -940,7 +1189,8 @@ def match_all(parts, world_step=None):
         for fl_name in [n for n in names if "flange" in n.lower()]:
             fl_feat = parts[fl_name]["features"]
             fl_filt = _bore_filter(fl_feat["cylinders"], fl_feat["planar"])
-            ms = match_slot(sh_filtered, fl_filt)
+            Ls = _pair_L(parts, sh_name, fl_name)
+            ms = match_slot(sh_filtered, fl_filt, GAMMA_CYL_MATCH * Ls, GAMMA_LINE_MATCH * Ls)
             if ms:
                 ms.sort(key=lambda m: m["t"], reverse=True)
                 for m in ms:
@@ -991,23 +1241,48 @@ def match_all(parts, world_step=None):
                         [lb["geometry"]["z"]["x"], lb["geometry"]["z"]["y"], lb["geometry"]["z"]["z"]], sx_b))
         del match_all._flange_face_labels
 
+    # === Step 2.5: 构建平面匹配邻居图（用于防止跨区误匹配）===
+    # 当两个零件都 PLANAR/FIF 匹配到同一个第三方但没有彼此直接匹配时，
+    # 它们分布在第三方不同区域，不应被 CYLINDER 直接配对
+    planar_neighbors = {}
+    for (na, nb) in planar_primary_pairs:
+        planar_neighbors.setdefault(na, set()).add(nb)
+        planar_neighbors.setdefault(nb, set()).add(na)
+    # FIF 配对同样加入邻居图（如 PSU 通过框架嵌入机箱）
+    for (na, nb) in processed_fif:
+        planar_neighbors.setdefault(na, set()).add(nb)
+        planar_neighbors.setdefault(nb, set()).add(na)
+    # 合并所有已知配对用于共享邻居判断
+    all_known_pairs = planar_primary_pairs | processed_fif
+
     # === Step 3: cylinder matching ===
     cyl_pairs = []
     for i in range(len(names)):
         for j in range(i + 1, len(names)):
             na, nb = names[i], names[j]
+            # 跳过共享平面邻居但彼此无直接平面匹配的零件对
+            common = planar_neighbors.get(na, set()) & planar_neighbors.get(nb, set())
+            if common and (na, nb) not in all_known_pairs and (nb, na) not in all_known_pairs:
+                print(f"  [SKIP-CYL] {na[:20]}<->{nb[:20]}: both planar-mated to {common}, no direct contact")
+                continue
             ca = parts[na]["features"]["cylinders"]
             cb = parts[nb]["features"]["cylinders"]
             is_fif = (na, nb) in processed_fif
             strict = len(ca) > 50 and len(cb) > 50
-            ref_a = face_info[na]["c"] if na in face_info else None
-            ref_b = face_info[nb]["c"] if nb in face_info else None
-            # 两面来自不同配合时（如都>200面），空间偏移验证无意义
-            if (na, nb) not in pairs_with_labels:
-                ref_a = ref_b = None
+            ref_info_a = face_info[na] if na in face_info else None
+            ref_info_b = face_info[nb] if nb in face_info else None
+            # 有 PLANAR PRIMARY 标签的零件对：保留空间参考，过滤远距离圆柱
+            if (na, nb) not in planar_primary_pairs and (nb, na) not in planar_primary_pairs:
+                ref_info_a = ref_info_b = None
+            ref_a = ref_info_a["c"] if ref_info_a else None
+            ref_b = ref_info_b["c"] if ref_info_b else None
+            Lc = _pair_L(parts, na, nb)
             ms = match_cylinders(ca, cb, strict_axis=strict,
                                  ref_a=(None if is_fif else ref_a),
-                                 ref_b=(None if is_fif else ref_b))
+                                 ref_b=(None if is_fif else ref_b),
+                                 face_info_a=(None if is_fif else ref_info_a),
+                                 face_info_b=(None if is_fif else ref_info_b),
+                                 cyl_tol=GAMMA_CYL_MATCH * Lc)
             # 框架嵌入对：用CAGE槽位中心过滤（均在CAGE CS内），非FAN面中心（FAN CS内）
             if is_fif and ms:
                 cage_name = na if len(ca) > len(cb) else nb
@@ -1070,24 +1345,50 @@ def match_all(parts, world_step=None):
             is_sf = (sh_name and (s_has == sh_name or b_has == sh_name)
                      and any("flange" in x for x in (na, nb)))
             if is_sf:
-                sf_key = "shaft-flange"
+                # 每对 shaft-flange 使用唯一键，允许多个法兰与同一轴配合
+                sf_key = f"shaft-flange-{s_has}-{b_has}"
                 if sf_key in used_sf: continue
                 used_sf.add(sf_key)
             kb = _ck(m["bore"])
             if kb in used_c.get(b_has, set()): continue
-            used_c.setdefault(b_has, set()).add(kb)
+            # boreToBore 不消耗 bore 的 used_c（boreToBore 仅用于验证，不阻止后续 shaft-bore 匹配）
+            if not m.get("bore_to_bore", False):
+                used_c.setdefault(b_has, set()).add(kb)
             s_cyl = m["shaft"]; b_cyl = m["bore"]
             bore_pt = None; shaft_pt = None
+            # Z 止推面：找离圆柱中点最近的 Z 主导面，投影得轴向定位点
+            def _find_z_stop(part_name, cyl):
+                best_face = None; best_dist = float("inf")
+                cyl_mid = cq.Vector(cyl["mid"][0], cyl["mid"][1], cyl["mid"][2])
+                cyl_dir = cq.Vector(cyl["dir"][0], cyl["dir"][1], cyl["dir"][2])
+                for pf in parts[part_name]["features"]["planar"]:
+                    if not _is_axial(pf["n"], parts, part_name): continue  # 非主轴向跳过
+                    fc = cq.Vector(pf["c"][0], pf["c"][1], pf["c"][2])
+                    # 面心沿轴投影距离
+                    proj = (fc - cyl_mid).dot(cyl_dir)
+                    proj_pt = cyl_mid + cyl_dir * proj
+                    dist = (fc - proj_pt).Length  # 面心到轴的垂直距离
+                    if dist < best_dist:
+                        best_dist = dist; best_face = pf
+                if best_face and best_dist < 30:  # 30mm 内有效
+                    return _bore_face_intersection(cyl, {"c": best_face["c"], "n": best_face["n"]})
+                return None
+
             if b_has in face_info:
                 bore_pt = _bore_face_intersection(m["bore"], face_info[b_has])
+            else:
+                bore_pt = _find_z_stop(b_has, m["bore"])
             if s_has in face_info:
                 shaft_pt = _bore_face_intersection(m["shaft"], face_info[s_has])
-            if is_sf and s_has in face_info:
-                fc_s = face_info[s_has]["c"]
+            else:
+                shaft_pt = _find_z_stop(s_has, m["shaft"])
+            if is_sf:
+                # 用法兰孔中点投影到轴线上：轴只有一个圆柱面时，
+                # 不同法兰孔位不同 → 轴原点不同 → 法兰不会堆叠
+                bm = cq.Vector(b_cyl["mid"][0], b_cyl["mid"][1], b_cyl["mid"][2])
                 sd = cq.Vector(s_cyl["dir"][0], s_cyl["dir"][1], s_cyl["dir"][2])
                 sm = cq.Vector(s_cyl["mid"][0], s_cyl["mid"][1], s_cyl["mid"][2])
-                fc_v = cq.Vector(fc_s[0], fc_s[1], fc_s[2])
-                proj = fc_v.sub(sm).dot(sd)
+                proj = bm.sub(sm).dot(sd)
                 shaft_pt = [sm.x + sd.x*proj, sm.y + sd.y*proj, sm.z + sd.z*proj]
             s_x = None; b_x = None
             if is_sf:
@@ -1288,6 +1589,10 @@ def match_all(parts, world_step=None):
                 labels[nm] = [l for l in labels[nm]
                               if not l["identifier"].endswith(f"_Mating_{gid}")]
         labels[na].append(la); labels[nb].append(lb)
+        # 同步更新 _primary_origins 为 fallback 选中的坐标
+        _primary_origins[(na, nb)] = (
+            [la["geometry"]["origin"]["x"], la["geometry"]["origin"]["y"], la["geometry"]["origin"]["z"]],
+            [lb["geometry"]["origin"]["x"], lb["geometry"]["origin"]["y"], lb["geometry"]["origin"]["z"]])
         # 继续处理 fallback_pairs 中其他碰撞对（不 break）
 
     return labels
@@ -1326,8 +1631,9 @@ if __name__ == "__main__":
         if not os.path.exists(feat_path):
             print(f"  [skip] {nm}: no features (run feature_extractor first)")
             continue
-        parts[nm] = {"features": json.load(open(feat_path, encoding="utf-8")),
-                     "shape_path": os.path.join(target, fp)}
+        with open(feat_path, encoding="utf-8") as f_feat:
+            parts[nm] = {"features": json.load(f_feat),
+                         "shape_path": os.path.join(target, fp)}
 
     # 解析 world_step（需先有 parts 才有 names）
     world_step = None
